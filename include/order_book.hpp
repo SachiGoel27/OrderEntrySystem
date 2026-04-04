@@ -2,9 +2,11 @@
 #include "price_level.hpp"
 #include <map>
 #include <unordered_map>
+#include <mutex>
 
 class OrderBook {
 private:
+    std::mutex book_mutex;
     // Balanced BST for bid side (descending order - highest price first)
     std::map<Price, PriceLevel, std::greater<Price>> bids;
     

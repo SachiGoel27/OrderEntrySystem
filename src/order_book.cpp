@@ -2,6 +2,7 @@
 #include <iostream>
 
 bool OrderBook::addOrder(Order* order) {
+    std::lock_guard<std::mutex> lock(book_mutex);
     if (!order || order->qty <= 0) return false;
     
     // Check if order ID already exists
@@ -39,6 +40,7 @@ bool OrderBook::addOrder(Order* order) {
 }
 
 bool OrderBook::cancelOrder(OrderID id) {
+    std::lock_guard<std::mutex> lock(book_mutex);
     // O(1) lookup in hash map
     auto it = order_map.find(id);
     if (it == order_map.end()) return false;
