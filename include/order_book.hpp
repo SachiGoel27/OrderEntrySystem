@@ -3,6 +3,7 @@
 #include <map>
 #include <unordered_map>
 #include <mutex>
+#include <functional>
 
 class OrderBook {
 private:
@@ -29,11 +30,11 @@ public:
     OrderBook() = default;
     
     // Core operations
-    bool addOrder(Order* order);
+    bool addOrder(Order* order, std::function<void(OrderID, Price, Quantity)> onTradeExecution);
     bool cancelOrder(OrderID id);
     
     // Matching (to be implemented later with matching engine)
-    void match();
+    void match(Order* incoming_order, std::function<void(OrderID, Price, Quantity)> onTradeExecution);
     
     // Accessors
     Price getBestBid() const;

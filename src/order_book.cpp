@@ -1,41 +1,115 @@
 #include "order_book.hpp"
 #include <iostream>
+#include <functional>
 
-bool OrderBook::addOrder(Order* order) {
+bool OrderBook::addOrder(Order* order, std::function<void(OrderID, Price, Quantity)> onTradeExecution) {
     std::lock_guard<std::mutex> lock(book_mutex);
     if (!order || order->qty <= 0) return false;
     
     // Check if order ID already exists
     if (order_map.find(order->id) != order_map.end()) return false;
     
-    Price price = order->price;
-    
-    if (order->side == Side::BUY) {
-        // If price level doesn't exist, create it (std::map does this automatically)
-        // operator[] creates a default PriceLevel if key doesn't exist
-        if (bids.find(price) == bids.end()) {
-            bids[price] = PriceLevel(price);
+    // 1. Fill-Or-Kill (FOK) Check
+    if (order->tif == TimeInForce::FOK) {
+        Quantity available_qty = 0;
+        if (order->side == Side::BUY) {
+            for (auto it = asks.begin(); it != asks.end(); ++it) {
+                if (order->type == OrderType::LIMIT && it->first > order->price) break;
+                available_qty += it->second.total_volume;
+                if (available_qty >= order->qty) break;
+            }
+        } else {
+            for (auto it = bids.begin(); it != bids.end(); ++it) {
+                if (order->type == OrderType::LIMIT && it->first < order->price) break;
+                available_qty += it->second.total_volume;
+                if (available_qty >= order->qty) break;
+            }
         }
-        bids[price].add(order);
         
-        // Update best bid cache
-        if (price > best_bid_price) {
-            best_bid_price = price;
+        // If not enough liquidity, kill the order immediately
+        if (available_qty < order->qty) {
+            // Cancelled
+            return false;
         }
-    } else { // SELL
-        if (asks.find(price) == asks.end()) {
-            asks[price] = PriceLevel(price);
-        }
-        asks[price].add(order);
+    }
+
+    // 2. Immediate Matching for Market/IOC/FOK & Crossing Limits
+    while (order->qty > 0) {
+        Price match_price = 0;
+        Order* resting_order = nullptr;
         
-        // Update best ask cache
-        if (price < best_ask_price) {
-            best_ask_price = price;
+        if (order->side == Side::BUY) {
+            if (asks.empty()) break;
+            auto best_ask = asks.begin();
+            if (order->type == OrderType::LIMIT && best_ask->first > order->price) break; // Limit not met
+            
+            resting_order = best_ask->second.head;
+            match_price = best_ask->first;
+        } else {
+            if (bids.empty()) break;
+            auto best_bid = bids.begin();
+            if (order->type == OrderType::LIMIT && best_bid->first < order->price) break; // Limit not met
+            
+            resting_order = best_bid->second.head;
+            match_price = best_bid->first;
+        }
+        
+        // Execute Trade
+        Quantity fill_qty = std::min(order->qty, resting_order->qty);
+        
+        if (onTradeExecution) {
+            onTradeExecution(order->id, match_price, fill_qty);
+            onTradeExecution(resting_order->id, match_price, fill_qty);
+        }
+        
+        order->qty -= fill_qty;
+        resting_order->qty -= fill_qty;
+        
+        // Remove filled resting order
+        if (resting_order->qty == 0) {
+            if (order->side == Side::BUY) {
+                asks.begin()->second.remove(resting_order);
+                order_map.erase(resting_order->id);
+                OrderPool::getInstance().release(resting_order);
+                if (asks.begin()->second.isEmpty()) {
+                    asks.erase(asks.begin());
+                    updateBestAsk();
+                }
+            } else {
+                bids.begin()->second.remove(resting_order);
+                order_map.erase(resting_order->id);
+                OrderPool::getInstance().release(resting_order);
+                if (bids.begin()->second.isEmpty()) {
+                    bids.erase(bids.begin());
+                    updateBestBid();
+                }
+            }
         }
     }
     
-    // Add to order map for O(1) lookup
-    order_map[order->id] = order;
+    // 3. Handle Remaining Quantity
+    if (order->qty > 0) {
+        if (order->type == OrderType::MARKET || order->tif == TimeInForce::IOC) {
+            // Market orders and IOCs do not rest on the book. Unfilled portion is cancelled.
+            return true; // Partially or entirely "failed to fill" but successfully processed
+        }
+    
+        // Add remaining limit order to the book
+        Price price = order->price;
+        
+        if (order->side == Side::BUY) {
+            if (bids.find(price) == bids.end()) bids[price] = PriceLevel(price);
+            bids[price].add(order);
+            if (price > best_bid_price) best_bid_price = price;
+        } else { // SELL
+            if (asks.find(price) == asks.end()) asks[price] = PriceLevel(price);
+            asks[price].add(order);
+            if (price < best_ask_price) best_ask_price = price;
+        }
+        
+        order_map[order->id] = order;
+    }
+    
     return true;
 }
 
@@ -94,49 +168,6 @@ void OrderBook::updateBestAsk() {
     } else {
         // std::map with std::less keeps lowest price at begin()
         best_ask_price = asks.begin()->first;
-    }
-}
-
-void OrderBook::match() {
-    while (canMatch()) {
-        // Get best bid and ask levels
-        PriceLevel& bid_level = bids.begin()->second;
-        PriceLevel& ask_level = asks.begin()->second;
-        
-        Order* buy_order = bid_level.head;
-        Order* sell_order = ask_level.head;
-        
-        // Determine fill quantity
-        Quantity fill_qty = std::min(buy_order->qty, sell_order->qty);
-        
-        // Execute fill (price = resting order's price, typically the ask)
-        // TODO: Generate trade execution report here
-        
-        buy_order->qty -= fill_qty;
-        sell_order->qty -= fill_qty;
-        
-        // Remove fully filled orders
-        if (buy_order->qty == 0) {
-            bid_level.remove(buy_order);
-            order_map.erase(buy_order->id);
-            // TODO: Return order to object pool instead of delete
-        }
-        
-        if (sell_order->qty == 0) {
-            ask_level.remove(sell_order);
-            order_map.erase(sell_order->id);
-        }
-        
-        // Clean up empty price levels
-        if (bid_level.isEmpty()) {
-            bids.erase(bids.begin());
-            updateBestBid();
-        }
-        
-        if (ask_level.isEmpty()) {
-            asks.erase(asks.begin());
-            updateBestAsk();
-        }
     }
 }
 
