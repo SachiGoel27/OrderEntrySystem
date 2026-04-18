@@ -5,7 +5,7 @@ CXX = g++
 # Wall --> show all warnings
 # std=c++17 --> have the modern c++ features
 # Iinclude -- > look for headers in the /include folder
-CXXFLAGS = -std=c++17 -O3 -Wall -Iinclude
+CXXFLAGS = -std=c++17 -O3 -Wall -Iinclude -I/opt/homebrew/include -I/usr/local/include -pthread -DCROW_USE_BOOST
 
 # directories
 SRCDIR = src
