@@ -79,4 +79,4 @@ dsa:
             - ring buffer: instead of a list that grows + shrinks, it uses fixed-size array
                 - pre-allocated memory
             - no locks: it uses compare-and-swap to aviod context switching, where the os pauses to read a thread
-            - cache line padding: disruptor pads variables to ensure they stay on their own cache lines
+            - cache line padding: disruptor pads variables to ensure they stay on their own cache lines   
