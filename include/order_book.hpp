@@ -1,52 +1,127 @@
 #pragma once
+
 #include "price_level.hpp"
-#include <map>
-#include <unordered_map>
-#include <mutex>
+#include <chrono>
 #include <functional>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+enum class AllocationMode { FIFO, PRO_RATA, HYBRID };
+
+struct HybridConfig {
+    double min_fifo_share = 0.5;
+    double stability_alpha = 0.5;
+    double cancel_decay = 0.95;
+    double price_decay = 0.95;
+    int price_decay_interval_ms = 10;
+    Quantity min_midpoint_guard_volume = 1;
+    size_t depth_levels = 2;
+};
+
+struct OrderBookConfig {
+    AllocationMode allocation_mode = AllocationMode::FIFO;
+    HybridConfig hybrid{};
+};
+
+struct MatchingDiagnostics {
+    double effective_liquidity = 0.0;
+    double cancel_heat = 0.0;
+    double price_heat = 0.0;
+    double stability = 0.0;
+    double fifo_share = 1.0;
+};
 
 class OrderBook {
 private:
-    std::mutex book_mutex;
+    using Clock = std::chrono::steady_clock;
+    using TradeCallback = std::function<void(OrderID, Price, Quantity)>;
+
+    struct LevelOrderView {
+        Order* order = nullptr;
+        Quantity qty = 0;
+        size_t fifo_rank = 0;
+    };
+
+    struct FillInstruction {
+        Order* order = nullptr;
+        Quantity qty = 0;
+    };
+
+    mutable std::mutex book_mutex;
+
     // Balanced BST for bid side (descending order - highest price first)
     std::map<Price, PriceLevel, std::greater<Price>> bids;
-    
+
     // Balanced BST for ask side (ascending order - lowest price first)
     std::map<Price, PriceLevel, std::less<Price>> asks;
-    
+
     // Order map for O(1) lookup by OrderID
     std::unordered_map<OrderID, Order*> order_map;
-    
-    // Top of book cache (optional optimization)
-    Price best_bid_price = 0;          // 0 means no bids
-    Price best_ask_price = INT64_MAX;  // INT64_MAX means no asks
-    
-    // Helper methods
+
+    // Top of book cache
+    Price best_bid_price = NO_BID;
+    Price best_ask_price = NO_ASK;
+
+    OrderBookConfig config_;
+    MatchingDiagnostics diagnostics_;
+    double cancel_heat_ = 0.0;
+    double price_heat_ = 0.0;
+    Clock::time_point last_price_decay_;
+    bool midpoint_valid_ = false;
+    double last_midpoint_ = 0.0;
+
+    bool canOrderMatchPrice(const Order* order, Price price) const;
+    bool passesFokCheck(const Order* order) const;
+    Quantity matchIncomingOrder(Order* order, const TradeCallback& onTradeExecution);
+    Quantity executeBestLevel(Order* order, const TradeCallback& onTradeExecution);
+    std::vector<LevelOrderView> snapshotLevel(const PriceLevel& level) const;
+    std::vector<Quantity> allocateFifo(const std::vector<LevelOrderView>& orders, Quantity target_qty) const;
+    std::vector<Quantity> allocateProRata(const std::vector<LevelOrderView>& orders, Quantity target_qty) const;
+    std::vector<FillInstruction> buildFillPlan(const PriceLevel& level, Quantity target_qty);
+    Quantity executeFillPlan(
+        Order* incoming_order,
+        Side resting_side,
+        Price price,
+        PriceLevel& level,
+        const std::vector<FillInstruction>& fill_plan,
+        const TradeCallback& onTradeExecution);
+    void restOrder(Order* order);
     void updateBestBid();
     void updateBestAsk();
     void removeEmptyPriceLevel(Side side, Price price);
-    
+    void releaseRestingOrders();
+    double levelDecay(Price reference_price, Price level_price) const;
+    double computeEffectiveLiquidity() const;
+    double computeHybridFifoShare(double stability) const;
+    void applyPriceHeatDecay(const Clock::time_point& now);
+    void updateMidpointHeat(const Clock::time_point& now);
+    MatchingDiagnostics computeDiagnosticsSnapshotLocked() const;
+    void syncDiagnosticsLocked();
+
 public:
-    OrderBook() = default;
-    
+    explicit OrderBook(OrderBookConfig config = {});
+    ~OrderBook();
+
     // Core operations
-    bool addOrder(Order* order, std::function<void(OrderID, Price, Quantity)> onTradeExecution);
+    bool addOrder(Order* order, TradeCallback onTradeExecution);
     bool cancelOrder(OrderID id);
-    
-    // Matching (to be implemented later with matching engine)
-    void match(Order* incoming_order, std::function<void(OrderID, Price, Quantity)> onTradeExecution);
-    
+    void match(Order* incoming_order, TradeCallback onTradeExecution);
+
     // Accessors
     Price getBestBid() const;
     Price getBestAsk() const;
     Quantity getVolumeAtPrice(Side side, Price price) const;
+    size_t getOrderCountAtPrice(Side side, Price price) const;
     Order* getOrder(OrderID id) const;
-    
+    MatchingDiagnostics getDiagnostics() const;
+
     // Check if order book can match (best bid >= best ask)
     bool canMatch() const;
-    
+
     // For debugging/display
     void printBook() const;
-    size_t getBidLevelCount() const { return bids.size(); }
-    size_t getAskLevelCount() const { return asks.size(); }
+    size_t getBidLevelCount() const;
+    size_t getAskLevelCount() const;
 };

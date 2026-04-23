@@ -1,8 +1,7 @@
 #pragma once
 #include "types.hpp"
-#include <vector>
 #include <mutex>
-#include <memory>
+#include <vector>
 
 enum class Side { BUY, SELL };
 enum class OrderType { LIMIT, MARKET };
@@ -51,6 +50,13 @@ public:
     }
 
     void release(Order* o) {
+        if (!o) return;
+        o->id = 0;
+        o->side = Side::BUY;
+        o->type = OrderType::LIMIT;
+        o->tif = TimeInForce::GTC;
+        o->price = 0;
+        o->qty = 0;
         o->next = nullptr;
         o->prev = nullptr;
         std::lock_guard<std::mutex> lock(pool_mutex);
