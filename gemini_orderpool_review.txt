@@ -1,3 +1,49 @@
+================================================================================
+GEMINI CODE REVIEW — OrderPool (ABA tag + overflow cleanup)
+================================================================================
+Paste this entire file into Google Gemini (or attach it). Ask for: correctness
+under concurrency, shutdown/lifetime hazards, and any missed edge cases.
+
+PROJECT CONTEXT (short)
+-----------------------
+OrderEntrySystem C++ matching engine uses OrderPool::getInstance() for fast
+allocation of Order objects: fixed slab (10k) + Treiber freelist; on exhaustion
+heap-allocates with new. Order::next is the freelist link when the order is
+idle in the pool; the same field is used on the book as part of a doubly-linked
+list — caller must not release() while the order is still linked on the book.
+
+RECENT GOALS (what changed)
+---------------------------
+1) ABA on the Treiber stack: add a 64-bit generation counter bundled with the
+   atomic head (tagged stack / wide CAS on FreeHead).
+2) Memory leak on overflow: every heap Order* from exhaustion is recorded in a
+   std::vector under a mutex; ~OrderPool drains the freelist then delete's each
+   tracked overflow pointer.
+
+LAST-MINUTE ADJUSTMENTS (this session)
+--------------------------------------
+- Overflow path uses std::unique_ptr<Order> until the pointer is successfully
+  recorded in overflow_allocations_; if vector::push_back throws (e.g. OOM), the
+  heap Order is freed instead of leaking.
+- Class-level comment documents shutdown contract: destructor must run only when
+  no concurrent acquire/release and no pool Order* still in use elsewhere.
+- is_slab_pointer uses storage_.data() for clarity.
+- Removed compile-time static_assert(std::atomic<FreeHead>::is_always_lock_free)
+  because MinGW/libstdc++ reported false while the translation unit still
+  compiles and the algorithm remains correct; a trailing comment explains this.
+
+QUESTIONS FOR THE REVIEWER
+--------------------------
+1) Is the memory_order usage on acquire/release/drain appropriate?
+2) Is drain_freelist_for_shutdown correct if it races (it assumes quiescence)?
+3) Any platform where sizeof(FreeHead)!=16 or atomic<FreeHead> breaks CAS?
+4) Suggest tests: stress acquire/release across threads; forced overflow;
+   shutdown after returning all orders to the pool vs. misuse cases.
+
+--------------------------------------------------------------------------------
+FULL SOURCE — include/order.hpp (authoritative for this review)
+--------------------------------------------------------------------------------
+
 #pragma once
 #include "types.hpp"
 #include <array>
@@ -154,3 +200,7 @@ public:
 // Note: libstdc++ may set std::atomic<FreeHead>::is_always_lock_free to false on some targets
 // (e.g. MinGW) even when the implementation still uses a single wide CAS where available.
 // The tagged Treiber stack remains correct either way; only contention cost may differ.
+
+================================================================================
+END OF FILE
+================================================================================

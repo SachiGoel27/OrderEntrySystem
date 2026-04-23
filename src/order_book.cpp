@@ -1,9 +1,65 @@
 #include "order_book.hpp"
+#include "types.hpp"
 #include <iostream>
 #include <functional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct LevelSnap {
+    Price price;
+    Quantity qty;
+};
+
+struct BookSnapCopy {
+    Price best_bid{};
+    Price best_ask{};
+    bool has_ask{false};
+    std::uint32_t connections{};
+    std::vector<LevelSnap> bids;
+    std::vector<LevelSnap> asks;
+};
+
+std::string build_book_json_from_copy(const BookSnapCopy& c) {
+    std::ostringstream oss;
+    oss << "{\"type\":\"book\",\"connections\":" << c.connections
+        << ",\"best_bid_cached\":" << c.best_bid << ",\"best_ask_cached\":";
+    if (c.has_ask) {
+        oss << c.best_ask;
+    } else {
+        oss << "null";
+    }
+    oss << ",\"best_bid\":" << c.best_bid << ",\"best_ask\":";
+    if (c.has_ask) {
+        oss << c.best_ask;
+    } else {
+        oss << "null";
+    }
+
+    oss << ",\"bids\":[";
+    for (std::size_t i = 0; i < c.bids.size(); ++i) {
+        if (i) {
+            oss << ',';
+        }
+        oss << "{\"price\":" << c.bids[i].price << ",\"qty\":" << c.bids[i].qty << "}";
+    }
+    oss << "],\"asks\":[";
+    for (std::size_t i = 0; i < c.asks.size(); ++i) {
+        if (i) {
+            oss << ',';
+        }
+        oss << "{\"price\":" << c.asks[i].price << ",\"qty\":" << c.asks[i].qty << "}";
+    }
+    oss << "]}";
+    return oss.str();
+}
+
+} // namespace
 
 bool OrderBook::addOrder(Order* order, std::function<void(OrderID, Price, Quantity)> onTradeExecution) {
-    std::lock_guard<std::mutex> lock(book_mutex);
+    std::lock_guard<std::recursive_mutex> lock(book_mutex);
     if (!order || order->qty <= 0) return false;
     
     // Check if order ID already exists
@@ -114,7 +170,7 @@ bool OrderBook::addOrder(Order* order, std::function<void(OrderID, Price, Quanti
 }
 
 bool OrderBook::cancelOrder(OrderID id) {
-    std::lock_guard<std::mutex> lock(book_mutex);
+    std::lock_guard<std::recursive_mutex> lock(book_mutex);
     // O(1) lookup in hash map
     auto it = order_map.find(id);
     if (it == order_map.end()) return false;
@@ -164,7 +220,7 @@ void OrderBook::updateBestBid() {
 
 void OrderBook::updateBestAsk() {
     if (asks.empty()) {
-        best_ask_price = INT64_MAX;
+        best_ask_price = NO_ASK;
     } else {
         // std::map with std::less keeps lowest price at begin()
         best_ask_price = asks.begin()->first;
@@ -206,12 +262,30 @@ Order* OrderBook::getOrder(OrderID id) const {
     return nullptr;
 }
 
+std::string OrderBook::snapshot_top_json(std::size_t max_levels, std::uint32_t connections) const {
+    BookSnapCopy c;
+    c.connections = connections;
+    {
+        std::lock_guard<std::recursive_mutex> lock(book_mutex);
+        c.best_bid = best_bid_price;
+        c.has_ask = (best_ask_price != NO_ASK);
+        c.best_ask = best_ask_price;
+        for (auto it = bids.begin(); it != bids.end() && c.bids.size() < max_levels; ++it) {
+            c.bids.push_back(LevelSnap{it->first, it->second.total_volume});
+        }
+        for (auto it = asks.begin(); it != asks.end() && c.asks.size() < max_levels; ++it) {
+            c.asks.push_back(LevelSnap{it->first, it->second.total_volume});
+        }
+    }
+    return build_book_json_from_copy(c);
+}
+
 void OrderBook::printBook() const {
     std::cout << "=== ORDER BOOK ===" << std::endl;
     
     std::cout << "ASKS (sell orders):" << std::endl;
     for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
-        std::cout << "  $" << it->first / 100.0 << " : " 
+        std::cout << "  $" << priceDisplay(it->first) << " : " 
                   << it->second.total_volume << " shares" << std::endl;
     }
     
@@ -219,7 +293,7 @@ void OrderBook::printBook() const {
     
     std::cout << "BIDS (buy orders):" << std::endl;
     for (const auto& [price, level] : bids) {
-        std::cout << "  $" << price / 100.0 << " : " 
+        std::cout << "  $" << priceDisplay(price) << " : " 
                   << level.total_volume << " shares" << std::endl;
     }
 }

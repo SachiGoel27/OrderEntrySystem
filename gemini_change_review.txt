@@ -1,0 +1,705 @@
+================================================================================
+GEMINI CODE REVIEW — OrderEntrySystem / OES Desktop (summary + unified diff)
+================================================================================
+Generated for: paste into Google Gemini (or attach this file + optional bundle).
+
+SCOPE (high level)
+------------------
+1) C++ matching engine: JSON WebSocket protocol, book snapshots, lock-free-ish
+   order pool, recursive mutex order book, fixed-point PRICE_SCALE = 1e6.
+2) desktop-ui/: Tauri 2 + Leptos CSR desktop client (WebSocket bridge, UI).
+3) stress_test.py: price literals updated for new scale.
+4) .gitignore: desktop-ui build artifacts.
+
+If you also want full current sources, use gemini_codebase_bundle.txt (regenerate
+if stale). This file focuses on WHAT changed and includes git diff for tracked
+repo files.
+
+--------------------------------------------------------------------------------
+A) C++ — OrderPool (lock-free Treiber stack)
+--------------------------------------------------------------------------------
+- File: include/order.hpp
+- Replaced std::mutex + std::vector<Order*> with:
+  - std::array<Order, 10000> slab (cache-line aligned)
+  - std::atomic<Order*> Treiber stack for acquire/release
+  - Overflow: new Order() (same as prior “exhaust pool” behavior)
+- Order::next doubles as freelist link when the object is in the pool; must
+  not be in use on the book when release() is called (unchanged contract).
+
+--------------------------------------------------------------------------------
+B) C++ — OrderBook::snapshot_top_json (don’t stringify under book_mutex)
+--------------------------------------------------------------------------------
+- File: src/order_book.cpp (+ anonymous namespace helpers)
+- Under lock: copy best bid/ask, top-N bid/ask levels into plain structs/vectors.
+- After lock: build JSON string (so UI snapshot work doesn’t hold matching lock).
+
+--------------------------------------------------------------------------------
+C) C++ — Fixed-point scale 100 → 1_000_000 (PRICE_SCALE)
+--------------------------------------------------------------------------------
+- File: include/types.hpp
+  - PRICE_SCALE = 1'000'000; priceDisplay(); TICK_SIZE comment.
+- Files: src/order_book.cpp (printBook), stress_test.py (price field).
+- Wire JSON: still integer "price" fields; semantics are now dollars * 1e6.
+
+--------------------------------------------------------------------------------
+D) C++ — Engine protocol / threading (main)
+--------------------------------------------------------------------------------
+- File: src/main.cpp
+- WebSocket JSON: book, fill, ack, error, cancel_result, client_ping/pong.
+- broadcast_book / broadcast_fill; OrderBook uses recursive_mutex (see
+  include/order_book.hpp) for snapshot during trade callback.
+
+--------------------------------------------------------------------------------
+E) Rust — desktop-ui/src-tauri/src/main.rs
+--------------------------------------------------------------------------------
+- PRICE_SCALE = 1_000_000.0 (must match C++).
+- Inner chart buffers: VecDeque<(f64,f64)> for midpoint_series & fill_markers.
+- trim_time_series: O(1) pop_front while t < cutoff (240s window).
+- UiState still uses Vec<(f64,f64)> for serde to WASM (cloned from deque).
+
+--------------------------------------------------------------------------------
+F) Leptos — desktop-ui/ui/
+--------------------------------------------------------------------------------
+- types.rs: PRICE_SCALE, price_to_display.
+- chart.rs: time vs midpoint chart; Re-center Y / Auto Y; manual Y window.
+- price_ladder.rs: ws_connected visual (gray when offline), status dot, 6dp.
+- lib.rs: wires ws_ok into PriceLadder.
+- order_entry.rs: default price string for $100.50 in new units.
+- README.md: documents scale.
+
+--------------------------------------------------------------------------------
+G) desktop-ui layout (untracked in git — list for reviewer)
+--------------------------------------------------------------------------------
+desktop-ui/Cargo.toml
+desktop-ui/README.md
+desktop-ui/src-tauri/Cargo.toml, build.rs, tauri.conf.json
+desktop-ui/src-tauri/capabilities/default.json
+desktop-ui/src-tauri/src/main.rs
+desktop-ui/ui/Cargo.toml, Trunk.toml, index.html
+desktop-ui/ui/src/lib.rs, types.rs, ipc.rs
+desktop-ui/ui/src/components/{mod,chart,health,order_entry,price_ladder,toasts}.rs
+
+--------------------------------------------------------------------------------
+H) BREAKING — clients must send prices in new integer scale
+--------------------------------------------------------------------------------
+Old convention (historical): internal int / 100 = dollars (approx).
+New convention: internal int / 1_000_000 = dollars (micro-dollar style ticks).
+
+Example: $100.50 → 100_500_000
+
+--------------------------------------------------------------------------------
+I) UNIFIED DIFF (git-tracked files only; branch vs index)
+--------------------------------------------------------------------------------
+The following diff is from: git diff (tracked modifications only).
+Untracked desktop-ui/ and gemini_codebase_bundle.txt are NOT included here.
+diff --git a/.gitignore b/.gitignore
+index e2874c7..f194b13 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,4 +2,7 @@ personal-notes.txt
+ .githuba
+ bin/
+ obj/
+-venv
+\ No newline at end of file
++venv
++desktop-ui/target/
++desktop-ui/ui/dist/
++desktop-ui/ui/target/
+\ No newline at end of file
+diff --git a/include/order.hpp b/include/order.hpp
+index 4931cca..37963a6 100644
+--- a/include/order.hpp
++++ b/include/order.hpp
+@@ -1,8 +1,8 @@
+ #pragma once
+ #include "types.hpp"
+-#include <vector>
+-#include <mutex>
+-#include <memory>
++#include <array>
++#include <atomic>
++#include <cstddef>
+ 
+ enum class Side { BUY, SELL };
+ enum class OrderType { LIMIT, MARKET };
+@@ -16,49 +16,73 @@ struct Order {
+     Price price;
+     Quantity qty;
+ 
+-    // pointers for doubly linked list (can change this to array backed queue later if needed)
++    // Doubly-linked list on the book; when idle in OrderPool, `next` is the Treiber freelist link.
+     Order* next = nullptr;
+     Order* prev = nullptr;
+ };
+ 
++/// Lock-free Treiber stack over a fixed slab. Overflow uses `new Order()` (rare beyond pool size).
+ class OrderPool {
+ private:
+-    std::vector<Order*> pool;
+-    std::mutex pool_mutex;
++    static constexpr std::size_t kPoolSize = 10000;
++    alignas(64) std::array<Order, kPoolSize> storage_{};
++    std::atomic<Order*> free_head_{nullptr};
+ 
+-public:
+-    OrderPool() {
+-        // Pre-allocate some orders to speed up initial allocation
+-        for (int i = 0; i < 10000; ++i) {
+-            pool.push_back(new Order());
++    void init_free_list() {
++        Order* h = nullptr;
++        for (std::size_t i = kPoolSize; i-- > 0;) {
++            Order& o = storage_[i];
++            o.next = h;
++            o.prev = nullptr;
++            h = &o;
+         }
++        free_head_.store(h, std::memory_order_release);
+     }
+ 
+-    ~OrderPool() {
+-        for (Order* o : pool) {
+-            delete o;
+-        }
+-    }
++public:
++    OrderPool() { init_free_list(); }
++    OrderPool(const OrderPool&) = delete;
++    OrderPool& operator=(const OrderPool&) = delete;
+ 
++    /// Hot path: lock-free pop; allocates on exhaustion.
+     Order* acquire() {
+-        std::lock_guard<std::mutex> lock(pool_mutex);
+-        if (pool.empty()) {
+-            return new Order();
++        for (;;) {
++            Order* h = free_head_.load(std::memory_order_acquire);
++            if (!h) {
++                return new Order();
++            }
++            Order* nxt = h->next;
++            if (free_head_.compare_exchange_weak(
++                    h,
++                    nxt,
++                    std::memory_order_acq_rel,
++                    std::memory_order_acquire)) {
++                return h;
++            }
+         }
+-        Order* o = pool.back();
+-        pool.pop_back();
+-        return o;
+     }
+ 
++    /// Hot path: lock-free push. `next`/`prev` must not be required by the book when released.
+     void release(Order* o) {
+-        o->next = nullptr;
++        if (!o) {
++            return;
++        }
+         o->prev = nullptr;
+-        std::lock_guard<std::mutex> lock(pool_mutex);
+-        pool.push_back(o);
++        for (;;) {
++            Order* h = free_head_.load(std::memory_order_acquire);
++            o->next = h;
++            if (free_head_.compare_exchange_weak(
++                    h,
++                    o,
++                    std::memory_order_acq_rel,
++                    std::memory_order_acquire)) {
++                return;
++            }
++        }
+     }
+-    
++
+     static OrderPool& getInstance() {
+         static OrderPool instance;
+         return instance;
+     }
+-};
+\ No newline at end of file
++};
+diff --git a/include/order_book.hpp b/include/order_book.hpp
+index f0ed475..57ac41d 100644
+--- a/include/order_book.hpp
++++ b/include/order_book.hpp
+@@ -4,10 +4,14 @@
+ #include <unordered_map>
+ #include <mutex>
+ #include <functional>
++#include <cstddef>
++#include <string>
++#include <cstdint>
+ 
+ class OrderBook {
+ private:
+-    std::mutex book_mutex;
++    // recursive: trade notifications may snapshot the book while matching holds the lock
++    mutable std::recursive_mutex book_mutex;
+     // Balanced BST for bid side (descending order - highest price first)
+     std::map<Price, PriceLevel, std::greater<Price>> bids;
+     
+@@ -19,7 +23,7 @@ private:
+     
+     // Top of book cache (optional optimization)
+     Price best_bid_price = 0;          // 0 means no bids
+-    Price best_ask_price = INT64_MAX;  // INT64_MAX means no asks
++    Price best_ask_price = NO_ASK;  // sentinel: no asks
+     
+     // Helper methods
+     void updateBestBid();
+@@ -49,4 +53,7 @@ public:
+     void printBook() const;
+     size_t getBidLevelCount() const { return bids.size(); }
+     size_t getAskLevelCount() const { return asks.size(); }
++
++    // JSON snapshot for UI: top N price levels each side + top-of-book cache fields
++    std::string snapshot_top_json(std::size_t max_levels, std::uint32_t connections) const;
+ };
+\ No newline at end of file
+diff --git a/include/types.hpp b/include/types.hpp
+index 8e1ee05..c5a0e37 100644
+--- a/include/types.hpp
++++ b/include/types.hpp
+@@ -1,11 +1,18 @@
+ #pragma once
+ #include <cstdint>
+ #include <limits>
+-// Fixed point: $10.50 --> 1050
++// Fixed-point: monetary amount = dollars * PRICE_SCALE (e.g. $10.50 -> 10_500_000).
++// Supports micro-tick style precision on the wire (int64 ticks).
+ using Price = int64_t;
+ using Quantity = int32_t;
+ using OrderID = uint64_t;
+ 
+-const Price TICK_SIZE = 1; // tick size is 1 cent.
+-const Price NO_BID = 0;
+-const Price NO_ASK = std::numeric_limits<Price>::max();
+\ No newline at end of file
++inline constexpr Price PRICE_SCALE = 1'000'000LL;
++/// Smallest representable price increment in internal units (= $1 / PRICE_SCALE).
++inline constexpr Price TICK_SIZE = 1;
++inline constexpr Price NO_BID = 0;
++inline constexpr Price NO_ASK = std::numeric_limits<Price>::max();
++
++inline double priceDisplay(Price p) {
++    return static_cast<double>(p) / static_cast<double>(PRICE_SCALE);
++}
+diff --git a/src/main.cpp b/src/main.cpp
+index f492d4c..3d6a26a 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -6,113 +6,150 @@
+ #include <functional>
+ #include <mutex>
+ #include <set>
++#include <sstream>
+ 
+ // Store active connections to broadcast trade reports
+ std::mutex connections_mutex;
+ std::set<crow::websocket::connection*> active_connections;
+ 
++static void broadcast_text(const std::string& msg) {
++    std::lock_guard<std::mutex> lock(connections_mutex);
++    for (auto* current_conn : active_connections) {
++        current_conn->send_text(msg);
++    }
++}
++
+ int main() {
+     crow::SimpleApp app;
+-    OrderBook book; 
+-    
+-    // std::atomic ensures that even if multiple threads ask for an ID at the 
+-    // exact same nanosecond, they are guaranteed to get unique, sequential numbers.
+-    std::atomic<uint64_t> global_order_id{1}; 
++    OrderBook book;
++
++    std::atomic<uint64_t> global_order_id{1};
++
++    auto broadcast_book = [&]() {
++        std::uint32_t n = 0;
++        {
++            std::lock_guard<std::mutex> lock(connections_mutex);
++            n = static_cast<std::uint32_t>(active_connections.size());
++        }
++        std::string j = book.snapshot_top_json(10, n);
++        broadcast_text(j);
++    };
++
++    auto broadcast_fill = [&](OrderID order_id, Price match_price, Quantity fill_qty) {
++        std::ostringstream oss;
++        oss << "{\"type\":\"fill\",\"order_id\":" << order_id << ",\"price\":" << match_price
++            << ",\"qty\":" << fill_qty << "}";
++        broadcast_text(oss.str());
++    };
+ 
+-    // Create a WebSocket route at ws://localhost:8080/ws
+     CROW_WEBSOCKET_ROUTE(app, "/ws")
+-      .onopen([&](crow::websocket::connection& conn) {
+-          std::lock_guard<std::mutex> lock(connections_mutex);
+-          active_connections.insert(&conn);
+-          std::cout << "New trader connected!" << std::endl;
+-      })
+-      .onclose([&](crow::websocket::connection& conn, const std::string& reason, uint16_t code) {
+-          std::lock_guard<std::mutex> lock(connections_mutex);
+-          active_connections.erase(&conn);
+-          std::cout << "Trader disconnected." << std::endl;
+-      })
+-      .onmessage([&](crow::websocket::connection& conn, const std::string& data, bool is_binary) {
+-          // 1. Parse the incoming JSON message
+-          auto incoming_json = crow::json::load(data);
+-          if (!incoming_json) {
+-              conn.send_text("Error: Invalid JSON format");
+-              return;
+-          }
+-
+-          if (incoming_json.has("action") && incoming_json["action"].s() == "cancel") {
+-              if (incoming_json.has("id")) {
+-                  OrderID id = incoming_json["id"].i();
+-                  bool success = book.cancelOrder(id);
+-                  if (success) {
+-                      conn.send_text("Success: Order " + std::to_string(id) + " cancelled.");
+-                  } else {
+-                      conn.send_text("Error: Failed to cancel order " + std::to_string(id) + ".");
+-                  }
+-              }
+-              return;
+-          }
+-
+-          // 2. Extract values (Expecting: {"side": "BUY", "price": 10050, "qty": 100})
+-          try {
+-              std::string side_str = incoming_json["side"].s();
+-              Price price = incoming_json.has("price") ? incoming_json["price"].i() : 0;
+-              Quantity qty = incoming_json["qty"].i();
+-              
+-              std::string type_str = "LIMIT";
+-              if (incoming_json.has("type")) type_str = incoming_json["type"].s();
+-              
+-              std::string tif_str = "GTC";
+-              if (incoming_json.has("tif")) tif_str = incoming_json["tif"].s();
+-
+-              Side side = (side_str == "BUY" || side_str == "buy") ? Side::BUY : Side::SELL;
+-              OrderType type = (type_str == "MARKET" || type_str == "market") ? OrderType::MARKET : OrderType::LIMIT;
+-              
+-              TimeInForce tif = TimeInForce::GTC;
+-              if (tif_str == "IOC" || tif_str == "ioc") tif = TimeInForce::IOC;
+-              if (tif_str == "FOK" || tif_str == "fok") tif = TimeInForce::FOK;
+-              
+-              uint64_t id = global_order_id.fetch_add(1);
+-
+-              // 3. Create the order using object pool
+-              Order* o = OrderPool::getInstance().acquire();
+-              o->id = id;
+-              o->side = side;
+-              o->type = type;
+-              o->tif = tif;
+-              o->price = price;
+-              o->qty = qty;
+-
+-              // 4. Add to the order book and execute match instantly
+-              auto trade_callback = [](OrderID order_id, Price match_price, Quantity fill_qty) {
+-                  std::string report = "Trade Execution: Order " + std::to_string(order_id) + " filled " + std::to_string(fill_qty) + " @ $" + std::to_string(match_price / 100.0);
+-                  std::lock_guard<std::mutex> lock(connections_mutex);
+-                  for (auto* current_conn : active_connections) {
+-                      current_conn->send_text(report);
+-                  }
+-              };
+-              
+-              bool success = book.addOrder(o, trade_callback);
+-
+-              if (success) {
+-                  conn.send_text("Success: Order " + std::to_string(id) + " processed.");
+-                  if (o->qty == 0 || o->type == OrderType::MARKET || o->tif == TimeInForce::IOC) {
+-                      // Handled immediately, no need to rest
+-                      if (o->qty > 0) {
+-                          conn.send_text("Status: Order " + std::to_string(id) + " cancelled remaining " + std::to_string(o->qty) + " (IOC/Market)");
+-                      }
+-                      OrderPool::getInstance().release(o);
+-                  }
+-              } else {
+-                  conn.send_text("Error: Failed to trace order or FOK condition not met.");
+-                  OrderPool::getInstance().release(o); 
+-              }
+-          } catch (const std::exception& e) {
+-              conn.send_text("Error: Missing required fields (side, price, qty)");
+-          }
+-      });
++        .onopen([&](crow::websocket::connection& conn) {
++            {
++                std::lock_guard<std::mutex> lock(connections_mutex);
++                active_connections.insert(&conn);
++            }
++            std::cout << "New trader connected!" << std::endl;
++            broadcast_book();
++        })
++        .onclose([&](crow::websocket::connection& conn, const std::string& reason, uint16_t code) {
++            std::lock_guard<std::mutex> lock(connections_mutex);
++            active_connections.erase(&conn);
++            std::cout << "Trader disconnected." << std::endl;
++        })
++        .onmessage([&](crow::websocket::connection& conn, const std::string& data, bool is_binary) {
++            auto incoming_json = crow::json::load(data);
++            if (!incoming_json) {
++                conn.send_text("{\"type\":\"error\",\"message\":\"Invalid JSON format\"}");
++                return;
++            }
++
++            if (incoming_json.has("type")) {
++                try {
++                    if (incoming_json["type"].s() == "client_ping") {
++                        int64_t id = 0;
++                        if (incoming_json.has("id")) {
++                            id = incoming_json["id"].i();
++                        }
++                        std::ostringstream pong;
++                        pong << "{\"type\":\"client_pong\",\"id\":" << id << "}";
++                        conn.send_text(pong.str());
++                        return;
++                    }
++                } catch (...) {
++                    // "type" exists but is not a string (e.g. numeric); fall through to order handling
++                }
++            }
++
++            if (incoming_json.has("action") && incoming_json["action"].s() == "cancel") {
++                if (incoming_json.has("id")) {
++                    OrderID id = static_cast<OrderID>(incoming_json["id"].i());
++                    bool success = book.cancelOrder(id);
++                    if (success) {
++                        conn.send_text("{\"type\":\"cancel_result\",\"success\":true,\"id\":" + std::to_string(id) + "}");
++                    } else {
++                        conn.send_text("{\"type\":\"cancel_result\",\"success\":false,\"id\":" + std::to_string(id) + "}");
++                    }
++                    broadcast_book();
++                }
++                return;
++            }
++
++            try {
++                std::string side_str = incoming_json["side"].s();
++                Price price = incoming_json.has("price") ? incoming_json["price"].i() : 0;
++                Quantity qty = incoming_json["qty"].i();
++
++                std::string type_str = "LIMIT";
++                if (incoming_json.has("type")) type_str = incoming_json["type"].s();
++
++                std::string tif_str = "GTC";
++                if (incoming_json.has("tif")) tif_str = incoming_json["tif"].s();
++
++                Side side = (side_str == "BUY" || side_str == "buy") ? Side::BUY : Side::SELL;
++                OrderType type = (type_str == "MARKET" || type_str == "market") ? OrderType::MARKET : OrderType::LIMIT;
++
++                TimeInForce tif = TimeInForce::GTC;
++                if (tif_str == "IOC" || tif_str == "ioc") tif = TimeInForce::IOC;
++                if (tif_str == "FOK" || tif_str == "fok") tif = TimeInForce::FOK;
++
++                uint64_t id = global_order_id.fetch_add(1);
++
++                Order* o = OrderPool::getInstance().acquire();
++                o->id = id;
++                o->side = side;
++                o->type = type;
++                o->tif = tif;
++                o->price = price;
++                o->qty = qty;
++
++                auto trade_callback = [&](OrderID order_id, Price match_price, Quantity fill_qty) {
++                    broadcast_fill(order_id, match_price, fill_qty);
++                    broadcast_book();
++                };
++
++                bool success = book.addOrder(o, trade_callback);
++
++                if (success) {
++                    conn.send_text("{\"type\":\"ack\",\"order_id\":" + std::to_string(id) + ",\"status\":\"accepted\"}");
++                    if (o->qty == 0 || o->type == OrderType::MARKET || o->tif == TimeInForce::IOC) {
++                        if (o->qty > 0) {
++                            conn.send_text("{\"type\":\"ack\",\"order_id\":" + std::to_string(id) +
++                                           ",\"status\":\"ioc_market_remainder\",\"remaining_qty\":" +
++                                           std::to_string(o->qty) + "}");
++                        }
++                        OrderPool::getInstance().release(o);
++                    }
++                } else {
++                    conn.send_text("{\"type\":\"error\",\"message\":\"FOK not satisfied or addOrder failed\"}");
++                    OrderPool::getInstance().release(o);
++                }
++                broadcast_book();
++            } catch (const std::exception& e) {
++                conn.send_text("{\"type\":\"error\",\"message\":\"Missing required fields (side, qty)\"}");
++            }
++        });
+ 
+     std::cout << "Matching Engine starting on port 8080..." << std::endl;
+-    
+-    // Run the server with 4 concurrent network threads
++
+     app.port(8080).multithreaded().run();
+-}
+\ No newline at end of file
++}
+diff --git a/src/order_book.cpp b/src/order_book.cpp
+index 5f519ec..bd2c0a6 100644
+--- a/src/order_book.cpp
++++ b/src/order_book.cpp
+@@ -1,9 +1,65 @@
+ #include "order_book.hpp"
++#include "types.hpp"
+ #include <iostream>
+ #include <functional>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace {
++
++struct LevelSnap {
++    Price price;
++    Quantity qty;
++};
++
++struct BookSnapCopy {
++    Price best_bid{};
++    Price best_ask{};
++    bool has_ask{false};
++    std::uint32_t connections{};
++    std::vector<LevelSnap> bids;
++    std::vector<LevelSnap> asks;
++};
++
++std::string build_book_json_from_copy(const BookSnapCopy& c) {
++    std::ostringstream oss;
++    oss << "{\"type\":\"book\",\"connections\":" << c.connections
++        << ",\"best_bid_cached\":" << c.best_bid << ",\"best_ask_cached\":";
++    if (c.has_ask) {
++        oss << c.best_ask;
++    } else {
++        oss << "null";
++    }
++    oss << ",\"best_bid\":" << c.best_bid << ",\"best_ask\":";
++    if (c.has_ask) {
++        oss << c.best_ask;
++    } else {
++        oss << "null";
++    }
++
++    oss << ",\"bids\":[";
++    for (std::size_t i = 0; i < c.bids.size(); ++i) {
++        if (i) {
++            oss << ',';
++        }
++        oss << "{\"price\":" << c.bids[i].price << ",\"qty\":" << c.bids[i].qty << "}";
++    }
++    oss << "],\"asks\":[";
++    for (std::size_t i = 0; i < c.asks.size(); ++i) {
++        if (i) {
++            oss << ',';
++        }
++        oss << "{\"price\":" << c.asks[i].price << ",\"qty\":" << c.asks[i].qty << "}";
++    }
++    oss << "]}";
++    return oss.str();
++}
++
++} // namespace
+ 
+ bool OrderBook::addOrder(Order* order, std::function<void(OrderID, Price, Quantity)> onTradeExecution) {
+-    std::lock_guard<std::mutex> lock(book_mutex);
++    std::lock_guard<std::recursive_mutex> lock(book_mutex);
+     if (!order || order->qty <= 0) return false;
+     
+     // Check if order ID already exists
+@@ -114,7 +170,7 @@ bool OrderBook::addOrder(Order* order, std::function<void(OrderID, Price, Quanti
+ }
+ 
+ bool OrderBook::cancelOrder(OrderID id) {
+-    std::lock_guard<std::mutex> lock(book_mutex);
++    std::lock_guard<std::recursive_mutex> lock(book_mutex);
+     // O(1) lookup in hash map
+     auto it = order_map.find(id);
+     if (it == order_map.end()) return false;
+@@ -164,7 +220,7 @@ void OrderBook::updateBestBid() {
+ 
+ void OrderBook::updateBestAsk() {
+     if (asks.empty()) {
+-        best_ask_price = INT64_MAX;
++        best_ask_price = NO_ASK;
+     } else {
+         // std::map with std::less keeps lowest price at begin()
+         best_ask_price = asks.begin()->first;
+@@ -206,12 +262,30 @@ Order* OrderBook::getOrder(OrderID id) const {
+     return nullptr;
+ }
+ 
++std::string OrderBook::snapshot_top_json(std::size_t max_levels, std::uint32_t connections) const {
++    BookSnapCopy c;
++    c.connections = connections;
++    {
++        std::lock_guard<std::recursive_mutex> lock(book_mutex);
++        c.best_bid = best_bid_price;
++        c.has_ask = (best_ask_price != NO_ASK);
++        c.best_ask = best_ask_price;
++        for (auto it = bids.begin(); it != bids.end() && c.bids.size() < max_levels; ++it) {
++            c.bids.push_back(LevelSnap{it->first, it->second.total_volume});
++        }
++        for (auto it = asks.begin(); it != asks.end() && c.asks.size() < max_levels; ++it) {
++            c.asks.push_back(LevelSnap{it->first, it->second.total_volume});
++        }
++    }
++    return build_book_json_from_copy(c);
++}
++
+ void OrderBook::printBook() const {
+     std::cout << "=== ORDER BOOK ===" << std::endl;
+     
+     std::cout << "ASKS (sell orders):" << std::endl;
+     for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
+-        std::cout << "  $" << it->first / 100.0 << " : " 
++        std::cout << "  $" << priceDisplay(it->first) << " : " 
+                   << it->second.total_volume << " shares" << std::endl;
+     }
+     
+@@ -219,7 +293,7 @@ void OrderBook::printBook() const {
+     
+     std::cout << "BIDS (buy orders):" << std::endl;
+     for (const auto& [price, level] : bids) {
+-        std::cout << "  $" << price / 100.0 << " : " 
++        std::cout << "  $" << priceDisplay(price) << " : " 
+                   << level.total_volume << " shares" << std::endl;
+     }
+ }
+diff --git a/stress_test.py b/stress_test.py
+index ecf0d21..2f98542 100644
+--- a/stress_test.py
++++ b/stress_test.py
+@@ -12,7 +12,8 @@ async def spam_orders(uri, thread_id):
+                 side = "BUY" if i % 2 == 0 else "SELL"
+                 order = {
+                     "side": side,
+-                    "price": 10000 + (i % 100), # Spread prices across 100 ticks
++                    # Internal price = dollars * 1e6 (legacy cent-style ladder * 10_000)
++                    "price": (10000 + (i % 100)) * 10000,
+                     "qty": 10
+                 }
+                 await websocket.send(json.dumps(order))
+
+--------------------------------------------------------------------------------
+J) AFTERWORD — desktop-ui not in git diff above
+--------------------------------------------------------------------------------
+The unified diff ends at the last line before this section. The entire
+`desktop-ui/` tree is currently untracked in this workspace’s git status, so
+`git diff` does not include it. For a full line-by-line review of the UI:
+- `git add desktop-ui` then `git diff --cached desktop-ui/`, or
+- use `gemini_codebase_bundle.txt` (regenerate with your script if needed), or
+- attach the `desktop-ui/` folder in Gemini if supported.
+
+Suggested review questions for Gemini:
+1) Is the Treiber stack correct (memory orders, ABA, interaction with Order::next)?
+2) Is snapshot copy complete vs JSON fields consumed by Rust?
+3) Is PRICE_SCALE consistent everywhere clients send prices?
+4) Any deadlock or lifetime issues between book_mutex and connections_mutex?
+

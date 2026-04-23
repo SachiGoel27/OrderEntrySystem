@@ -4,10 +4,14 @@
 #include <unordered_map>
 #include <mutex>
 #include <functional>
+#include <cstddef>
+#include <string>
+#include <cstdint>
 
 class OrderBook {
 private:
-    std::mutex book_mutex;
+    // recursive: trade notifications may snapshot the book while matching holds the lock
+    mutable std::recursive_mutex book_mutex;
     // Balanced BST for bid side (descending order - highest price first)
     std::map<Price, PriceLevel, std::greater<Price>> bids;
     
@@ -19,7 +23,7 @@ private:
     
     // Top of book cache (optional optimization)
     Price best_bid_price = 0;          // 0 means no bids
-    Price best_ask_price = INT64_MAX;  // INT64_MAX means no asks
+    Price best_ask_price = NO_ASK;  // sentinel: no asks
     
     // Helper methods
     void updateBestBid();
@@ -49,4 +53,7 @@ public:
     void printBook() const;
     size_t getBidLevelCount() const { return bids.size(); }
     size_t getAskLevelCount() const { return asks.size(); }
+
+    // JSON snapshot for UI: top N price levels each side + top-of-book cache fields
+    std::string snapshot_top_json(std::size_t max_levels, std::uint32_t connections) const;
 };

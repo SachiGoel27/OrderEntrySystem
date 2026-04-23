@@ -12,7 +12,8 @@ async def spam_orders(uri, thread_id):
                 side = "BUY" if i % 2 == 0 else "SELL"
                 order = {
                     "side": side,
-                    "price": 10000 + (i % 100), # Spread prices across 100 ticks
+                    # Internal price = dollars * 1e6 (legacy cent-style ladder * 10_000)
+                    "price": (10000 + (i % 100)) * 10000,
                     "qty": 10
                 }
                 await websocket.send(json.dumps(order))
