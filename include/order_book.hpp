@@ -120,6 +120,13 @@ public:
     // Check if order book can match (best bid >= best ask)
     bool canMatch() const;
 
+    // Telemetry updates
+    void recordCancelHeat();
+    void recordPriceHeat(Price old_price, Price new_price);
+    
+    // Triggers the 10ms decay and recalculates S
+    void tickTelemetry();
+
     // For debugging/display
     void printBook() const;
     size_t getBidLevelCount() const;

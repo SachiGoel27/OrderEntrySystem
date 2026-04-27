@@ -28,6 +28,46 @@ OrderBook::OrderBook(OrderBookConfig config)
     syncDiagnosticsLocked();
 }
 
+void OrderBook::recordCancelHeat() {
+    std::lock_guard<std::mutex> lock(book_mutex);
+    // Add 1 unit of heat per cancel event
+    diagnostics_.cancel_heat += 1.0; 
+}
+
+void OrderBook::recordPriceHeat(Price old_price, Price new_price) {
+    if (old_price == 0 || new_price == 0) return; // Ignore initialization
+    std::lock_guard<std::mutex> lock(book_mutex);
+    // Add the delta of the price change
+    diagnostics_.price_heat += std::abs(static_cast<double>(new_price - old_price));
+}
+
+void OrderBook::tickTelemetry() {
+    std::lock_guard<std::mutex> lock(book_mutex);
+    
+    // 1. Apply 10ms decay (0.95 multiplier)
+    diagnostics_.cancel_heat *= 0.95;
+    diagnostics_.price_heat *= 0.95;
+
+    // 2. Calculate Effective Liquidity (Top-of-book depth)
+    Quantity top_bid_vol = 0;
+    Quantity top_ask_vol = 0;
+    
+    if (!bids.empty()) {
+        // Assuming bids map is ordered std::greater<Price> or similar. 
+        // Adjust if your map sorting requires bids.rbegin()
+        top_bid_vol = bids.begin()->second.total_volume; 
+    }
+    if (!asks.empty()) {
+        top_ask_vol = asks.begin()->second.total_volume;
+    }
+    
+    diagnostics_.effective_liquidity = static_cast<double>(top_bid_vol + top_ask_vol);
+
+    // 3. Calculate Stability (S)
+    diagnostics_.stability = diagnostics_.effective_liquidity / 
+                             (diagnostics_.cancel_heat + diagnostics_.price_heat + 1.0);
+}
+
 OrderBook::~OrderBook() {
     std::lock_guard<std::mutex> lock(book_mutex);
     releaseRestingOrders();
@@ -101,6 +141,7 @@ bool OrderBook::cancelOrder(OrderID id) {
     const Clock::time_point now = Clock::now();
     updateMidpointHeat(now);
     syncDiagnosticsLocked();
+    recordCancelHeat();
     return true;
 }
 
@@ -357,11 +398,19 @@ void OrderBook::restOrder(Order* order) {
 }
 
 void OrderBook::updateBestBid() {
+    Price old_best = best_bid_price;
     best_bid_price = bids.empty() ? NO_BID : bids.begin()->first;
+    if (old_best != best_bid_price) {
+        recordPriceHeat(old_best, best_bid_price);
+    }
 }
 
 void OrderBook::updateBestAsk() {
+    Price old_best = best_bid_price;
     best_ask_price = asks.empty() ? NO_ASK : asks.begin()->first;
+    if (old_best != best_ask_price) {
+        recordPriceHeat(old_best, best_ask_price);
+    }
 }
 
 void OrderBook::removeEmptyPriceLevel(Side side, Price price) {

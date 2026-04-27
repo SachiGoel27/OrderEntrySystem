@@ -111,6 +111,45 @@ int main() {
           }
       });
 
+
+    std::thread telemetry_thread([&book]() {
+        int tick_counter = 0;
+        
+        while(true) {
+            // Sleep for 10ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            
+            // Trigger decay and compute 'S'
+            book.tickTelemetry();
+            tick_counter++;
+
+            // Every 10 ticks (100ms), broadcast to WebSockets
+            if (tick_counter >= 10) {
+                tick_counter = 0;
+                
+                // Construct the JSON payload
+                MatchingDiagnostics diag = book.getDiagnostics();
+                crow::json::wvalue msg;
+                msg["type"] = "telemetry";
+                msg["timestamp"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                msg["S"] = diag.stability;
+                msg["L_eff"] = diag.effective_liquidity;
+                msg["H_c"] = diag.cancel_heat;
+                msg["H_p"] = diag.price_heat;
+                
+                std::string payload = msg.dump();
+                
+                // Safely broadcast
+                std::lock_guard<std::mutex> lock(connections_mutex);
+                for (auto* conn : active_connections) {
+                    conn->send_text(payload);
+                }
+            }
+        }
+    });
+    telemetry_thread.detach();
+    
     std::cout << "Matching Engine starting on port 8080..." << std::endl;
     
     // Run the server with 4 concurrent network threads
