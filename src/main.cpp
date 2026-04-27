@@ -13,7 +13,10 @@ std::set<crow::websocket::connection*> active_connections;
 
 int main() {
     crow::SimpleApp app;
-    OrderBook book; 
+    // pure fifo simulation
+    OrderBookConfig config;
+    config.allocation_mode = AllocationMode::FIFO;
+    OrderBook book(config);
     
     // std::atomic ensures that even if multiple threads ask for an ID at the 
     // exact same nanosecond, they are guaranteed to get unique, sequential numbers.

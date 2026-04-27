@@ -41,6 +41,46 @@ void OrderBook::recordPriceHeat(Price old_price, Price new_price) {
     diagnostics_.price_heat += std::abs(static_cast<double>(new_price - old_price));
 }
 
+void OrderBook::apply_decay(uint64_t current_time_ms) {
+    if (last_decay_time_ms == 0) {
+        last_decay_time_ms = current_time_ms;
+        return;
+    }
+
+    uint64_t elapsed = current_time_ms - last_decay_time_ms;
+    int intervals = elapsed / 10; // Number of 10ms ticks
+
+    if (intervals > 0) {
+        double decay_factor = std::pow(0.95, intervals);
+        h_p *= decay_factor;
+        h_c *= decay_factor;
+        
+        // Advance the tracker by the exact number of intervals processed
+        last_decay_time_ms += intervals * 10; 
+    }
+}
+
+double OrderBook::calculate_l_eff() const {
+    double l_eff = 0.0;
+    // Iterate through top N levels of bids and asks
+    // Example pseudocode:
+    // auto bid_it = bids.begin();
+    // for(int i=0; i < L_EFF_DEPTH && bid_it != bids.end(); ++i, ++bid_it) {
+    //     l_eff += bid_it->second.total_volume;
+    // }
+    return l_eff;
+}
+
+double OrderBook::calculate_s() const {
+    double l_eff = calculate_l_eff();
+    return l_eff / (h_c + h_p + 1.0);
+}
+
+void OrderBook::log_metrics(uint64_t current_time_ms) {
+    double l_eff = calculate_l_eff();
+    double s = l_eff / (h_c + h_p + 1.0);
+}
+
 void OrderBook::tickTelemetry() {
     std::lock_guard<std::mutex> lock(book_mutex);
     

@@ -4,6 +4,7 @@ import json
 import random
 import time
 import csv
+import numpy as np
 
 URI = "ws://localhost:8080/ws"
 
@@ -74,34 +75,45 @@ class BaseAgent:
 class DataLogger(BaseAgent):
     def __init__(self, name, filename="fifo_telemetry.csv"):
         super().__init__(name)
-        self.filename = filename
-        self.file = open(self.filename, mode='w', newline='')
-        self.writer = csv.writer(self.file)
-        self.writer.writerow(["Timestamp", "S", "L_eff", "H_c", "H_p"])
-        print(f"[{self.name}] Logging telemetry to {self.filename}")
+        self.stability_values = []
+        # Open CSV to record the time series
+        self.csv_file = open('stability_bounds.csv', 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(['timestamp', 'S', 'L_eff', 'H_c', 'H_p'])
 
     async def on_message(self, data):
         # Listen exclusively for the telemetry payload from the 100ms C++ timer
         if data.get("type") == "telemetry":
-            self.writer.writerow([
-                data.get("timestamp"),
-                data.get("S", 0),
-                data.get("L_eff", 0),
-                data.get("H_c", 0),
-                data.get("H_p", 0)
+            s_val = data.get("S", 0.0)
+            self.stability_values.append(s_val)
+            
+            # Log to CSV for graphing later
+            self.csv_writer.writerow([
+                data.get("timestamp"), 
+                s_val, 
+                data.get("L_eff"), 
+                data.get("H_c"), 
+                data.get("H_p")
             ])
-            # Flush to ensure data is written if the script crashes
-            self.file.flush()
 
-    async def stop(self):
-        await super().stop()
-        self.file.close()
+    def close(self):
+        self.csv_file.close()
 
 
 class MarketMaker(BaseAgent):
     def __init__(self, name, anchor_price):
         super().__init__(name)
         self.anchor_price = anchor_price  # e.g., 1000 for $10.00
+        self.panicking = False
+
+    async def trigger_panic(self):
+        """Simulates adverse selection avoidance by scrubbing all quotes."""
+        if not self.panicking:
+            self.panicking = True
+            print(f"[{self.name}] Adverse selection detected! Scrubbing quotes...")
+            # Fire the massive cancel avalanche to pull all resting liquidity
+            await self.send_order("cancel_all", "LIMIT", "BUY", 0, 0)
+            await self.send_order("cancel_all", "LIMIT", "SELL", 0, 0)
 
     async def behavior_loop(self):
         # Establish a massive, stable queue for S_max
@@ -112,7 +124,8 @@ class MarketMaker(BaseAgent):
         
         while self.running:
             # Periodically refresh quotes slowly to simulate passive liquidity
-            await asyncio.sleep(5)
+            if self.panicking:
+                await asyncio.sleep(5)
             await self.send_order("new_order", "LIMIT", "BUY", self.anchor_price - 5, 1000)
 
 
@@ -175,6 +188,9 @@ async def main():
 
     print("\n=== PHASE 2: MIN STABILITY ===")
     print("Unleashing HFT Snipers to penny the spread. Expect S to collapse.")
+    for maker in makers:
+        await maker.trigger_panic()
+        
     for sniper in snipers:
         await sniper.connect()
         agents.append(sniper)
@@ -182,9 +198,30 @@ async def main():
     await asyncio.sleep(15)
 
     print("\n=== SIMULATION COMPLETE ===")
-    print("Shutting down agents...")
-    for agent in agents:
-        await agent.stop()
+
+    logger.close()
+    
+    # Calculate the bounds from the collected data
+    s_array = np.array(logger.stability_values)
+    
+    if len(s_array) > 0:
+        # We use percentiles instead of strictly min/max to filter out 
+        # the initial 0.0 values from when the book is completely empty, 
+        # or massive edge-case spikes.
+        s_min = np.percentile(s_array, 5)   # Bottom 5%
+        s_max = np.percentile(s_array, 95)  # Top 5%
+        s_median = np.median(s_array)
+        
+        print(f"Total Telemetry Ticks Logged: {len(s_array)}")
+        print(f"Empirical S_min (5th percentile):  {s_min:.4f}")
+        print(f"Empirical S_max (95th percentile): {s_max:.4f}")
+        print(f"Median S value:                    {s_median:.4f}")
+        
+        print("\nYou can now use these bounds to map your exponential function!")
+        print("Example: f(S) = a * exp(b * S) + c")
+        print(f"Where f({s_min:.4f}) maps to 50% FIFO, and f({s_max:.4f}) maps to 100% FIFO.")
+    else:
+        print("Error: No telemetry data collected. Check WebSocket connection.")
 
 if __name__ == "__main__":
     asyncio.run(main())

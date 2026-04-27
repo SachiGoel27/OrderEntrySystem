@@ -7,6 +7,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <fstream>
 
 enum class AllocationMode { FIFO, PRO_RATA, HYBRID };
 
@@ -100,6 +101,15 @@ private:
     MatchingDiagnostics computeDiagnosticsSnapshotLocked() const;
     void syncDiagnosticsLocked();
 
+    // stability metric tracking
+    double h_p = 0.0;
+    double h_c = 0.0;
+    uint64_t last_decay_time_ms = 0;
+    
+    // configurable depth for effective liquidity
+    const int L_EFF_DEPTH = 5; 
+    
+
 public:
     explicit OrderBook(OrderBookConfig config = {});
     ~OrderBook();
@@ -131,4 +141,12 @@ public:
     void printBook() const;
     size_t getBidLevelCount() const;
     size_t getAskLevelCount() const;
+
+    // Lazy decay function
+    void apply_decay(uint64_t current_time_ms);
+    
+    // Metric Calculations
+    double calculate_l_eff() const;
+    double calculate_s() const;
+    void log_metrics(uint64_t current_time_ms);
 };
