@@ -1,0 +1,2675 @@
+GEMINI_CODEBASE_BUNDLE
+Generated: 2026-04-18 17:26
+Root: c:\Order Entry\OrderEntrySystem
+OMITTED: scripts/*.csv (generated data); .venv/; build dirs; desktop-ui/**/target|dist
+
+================================================================================
+FILE: Makefile
+================================================================================
+# Complier + Flags
+CXX = g++
+
+# O3 --> this is for aggressive optimization; tells complier to optimize for speed
+# Wall --> show all warnings
+# std=c++17 --> have the modern c++ features
+# Iinclude -- > look for headers in the /include folder
+CXXFLAGS = -std=c++17 -O3 -Wall -Iinclude -I/opt/homebrew/include -I/usr/local/include -pthread -DCROW_USE_BOOST
+
+# directories
+SRCDIR = src
+OBJDIR = obj
+BINDIR = bin
+
+# find all .cpp files in src/
+SOURCES = $(wildcard $(SRCDIR)/*.cpp)
+
+# convert src/file.cpp into obj/fil.o
+OBJECTS = $(SOURCES:$(SRCDIR)/%.cpp=$(OBJDIR)/%.o)
+TARGET = $(BINDIR)/oes_engine
+
+# rules
+all: $(TARGET)
+
+# link objects to final binary
+$(TARGET): $(OBJECTS)
+	@mkdir -p $(BINDIR)
+	$(CXX) $(CXXFLAGS) $(OBJECTS) -o $(TARGET)
+
+# complie each .cpp into a .o
+$(OBJDIR)/%.o: $(SRCDIR)/%.cpp
+	@mkdir -p $(OBJDIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# clean build files
+clean:
+	rm -rf $(OBJDIR) $(BINDIR)
+
+.PHONY: all clean
+
+================================================================================
+FILE: .gitignore
+================================================================================
+personal-notes.txt
+.githuba
+bin/
+obj/
+venv
+desktop-ui/target/
+desktop-ui/ui/dist/
+desktop-ui/ui/target/
+
+================================================================================
+FILE: Readme.txt
+================================================================================
+git status: show what branch you are own
+
+git -b checkout (branch name): create a branch and put yourself on the branch
+
+git checkout (branch name) : go to the branch you created
+
+git push -u origin branch-name (for a new branch to push upstream)
+
+to add:
+git add . : (adds everything that you changed)
+git commit -m "" : (in the paranthesis write what you wrote)
+git push : (ensure it is on your branch not main)
+
+do a pr on github.com to merge into main
+
+we trying to stress this so download: 
+(cd to include) mac: curl -LO https://github.com/CrowCpp/Crow/releases/download/v1.0+5/crow_all.h
+brew install boost
+(cd to include) windows: wget https://github.com/CrowCpp/Crow/releases/download/v1.0+5/crow_all.h
+
+
+current dsa ideas:
+
+- order book with b-trees/avls so add is O(log n)
+    - each book's price will point to a doubly linked list each node in the list
+    is the order object
+
+- order map, is a hash map O(1) removal
+    - since we have a doubly linked list/array backed queue we can go to the exact spot in memory
+    to remove the order.
+
+- each ticker will have its own order book and order map.
+
+
+Notes:
+- oes usually sits in front of the matching enegine
+    - oes, would handle user authentication, FIX protocol (industry standard protocol), pre-trade risk, etc
+
+dsa:
+- b-trees and avls are good for general book, but for high performance:
+
+- indexed array:
+    - if a stock is trading with .01 ticks and the stock can trade between $100 and $110, then we have 1000 possible points
+        - we use a pre-allocated array where each index points to a doubly linked list (or array-backed queue based on what we decide)
+        - O(1) access
+        - can have a lot of wasted memory
+        - better with a known range.
+    - Radix Tree/Trie
+        - more space-efficent than balanced bst
+        - treats each price as a string of bits to find the best bid/ask by walking down the bits
+        - better for sparse data
+
+- performance:
+    - free() delete results in system call to the os, which means os has to reorganize memory , so we are recylcing objects in our object pool
+    - high-performance systems new/malloc are bad since the os allocator will add latency
+        - possibly use object pooling: pre-allocate Order objects (1,000,000 or so) so we grab from these objects and return to pool
+    - have a top of the book cache to prevent traversing tree when we need the best bid and ask making price validation O(1)
+    - integer math:
+        - i think this is what bryce was talking about
+        - don't use float/double since floating point errors will ruin ledger
+            - .1 + .2 = .3000000004
+            - store $10.50 as 1050000
+
+- linked list vs array-backed queue:
+    - linked list:
+        - append: O(1)
+        - remove: O(1) (front + middle)
+        - poor cache because of objects in heap
+        - high memory overhead because of 2 points per order
+    - array-backed:
+        - append: O(1) *
+        - remove: O(1) (front)
+        - remove: O(N) (middle)
+        - good cache because of contigious memory
+        - low memory overhead
+
+    - linked list: cancelations are frequent, array-backed would result in O(N) operations each cancelation
+        - we can use 'lazy deletion', include a is_cancelled so we don't need to shift elements
+    - possibly use this? https://lmax-exchange.github.io/disruptor/
+        - *later when we implement multi-threading*
+        - it is for moving data between threads without much friction
+            - traditional queues force CPU to stop + check with OS, disruptor uses mechanical sympathy
+        - it uses:
+            - ring buffer: instead of a list that grows + shrinks, it uses fixed-size array
+                - pre-allocated memory
+            - no locks: it uses compare-and-swap to aviod context switching, where the os pauses to read a thread
+            - cache line padding: disruptor pads variables to ensure they stay on their own cache lines
+
+================================================================================
+FILE: stress_test.py
+================================================================================
+import asyncio
+import websockets
+import json
+import time
+
+async def spam_orders(uri, thread_id):
+    """Spams 10,000 orders as fast as possible from a single connection."""
+    try:
+        async with websockets.connect(uri) as websocket:
+            for i in range(10000):
+                # Alternate between buy and sell to mix up the tree traversal
+                side = "BUY" if i % 2 == 0 else "SELL"
+                order = {
+                    "side": side,
+                    "price": 10000 + (i % 100), # Spread prices across 100 ticks
+                    "qty": 10
+                }
+                await websocket.send(json.dumps(order))
+                
+                # Optional: wait for response, or just blind-fire
+                # response = await websocket.recv() 
+    except Exception as e:
+        print(f"Thread {thread_id} failed: {e}")
+
+async def main():
+    uri = "ws://localhost:8080/ws"
+    print("Starting stress test...")
+    start_time = time.time()
+    
+    # Create 20 concurrent network connections, all firing simultaneously
+    tasks = [spam_orders(uri, i) for i in range(20)]
+    
+    # Run them all at once
+    await asyncio.gather(*tasks)
+    
+    print(f"Test completed in {time.time() - start_time:.2f} seconds.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+FILE: include\types.hpp
+================================================================================
+#pragma once
+#include <cstdint>
+#include <limits>
+// Fixed point: $10.50 --> 1050
+using Price = int64_t;
+using Quantity = int32_t;
+using OrderID = uint64_t;
+
+const Price TICK_SIZE = 1; // tick size is 1 cent.
+const Price NO_BID = 0;
+const Price NO_ASK = std::numeric_limits<Price>::max();
+
+================================================================================
+FILE: include\order.hpp
+================================================================================
+#pragma once
+#include "types.hpp"
+#include <vector>
+#include <mutex>
+#include <memory>
+
+enum class Side { BUY, SELL };
+enum class OrderType { LIMIT, MARKET };
+enum class TimeInForce { GTC, IOC, FOK };
+
+struct Order {
+    OrderID id;
+    Side side;
+    OrderType type = OrderType::LIMIT;
+    TimeInForce tif = TimeInForce::GTC;
+    Price price;
+    Quantity qty;
+
+    // pointers for doubly linked list (can change this to array backed queue later if needed)
+    Order* next = nullptr;
+    Order* prev = nullptr;
+};
+
+class OrderPool {
+private:
+    std::vector<Order*> pool;
+    std::mutex pool_mutex;
+
+public:
+    OrderPool() {
+        // Pre-allocate some orders to speed up initial allocation
+        for (int i = 0; i < 10000; ++i) {
+            pool.push_back(new Order());
+        }
+    }
+
+    ~OrderPool() {
+        for (Order* o : pool) {
+            delete o;
+        }
+    }
+
+    Order* acquire() {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (pool.empty()) {
+            return new Order();
+        }
+        Order* o = pool.back();
+        pool.pop_back();
+        return o;
+    }
+
+    void release(Order* o) {
+        o->next = nullptr;
+        o->prev = nullptr;
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        pool.push_back(o);
+    }
+    
+    static OrderPool& getInstance() {
+        static OrderPool instance;
+        return instance;
+    }
+};
+
+================================================================================
+FILE: include\price_level.hpp
+================================================================================
+#pragma once
+#include "order.hpp"
+
+class PriceLevel {
+public:
+    Price price = 0; // the price this level represents
+    Order* head = nullptr; // oldest order (first to be filled)
+    Order* tail = nullptr; // newest order
+    int total_volume = 0; // total shares sitting at this price
+
+    PriceLevel() = default;
+    explicit PriceLevel(Price p) : price(p) {}
+
+
+    void add(Order* order);
+    void remove(Order* order);
+    bool isEmpty() const {return head == nullptr; }
+};
+
+================================================================================
+FILE: include\order_book.hpp
+================================================================================
+#pragma once
+#include "price_level.hpp"
+#include <map>
+#include <unordered_map>
+#include <mutex>
+#include <functional>
+#include <cstddef>
+#include <string>
+#include <cstdint>
+
+class OrderBook {
+private:
+    // recursive: trade notifications may snapshot the book while matching holds the lock
+    mutable std::recursive_mutex book_mutex;
+    // Balanced BST for bid side (descending order - highest price first)
+    std::map<Price, PriceLevel, std::greater<Price>> bids;
+    
+    // Balanced BST for ask side (ascending order - lowest price first)
+    std::map<Price, PriceLevel, std::less<Price>> asks;
+    
+    // Order map for O(1) lookup by OrderID
+    std::unordered_map<OrderID, Order*> order_map;
+    
+    // Top of book cache (optional optimization)
+    Price best_bid_price = 0;          // 0 means no bids
+    Price best_ask_price = INT64_MAX;  // INT64_MAX means no asks
+    
+    // Helper methods
+    void updateBestBid();
+    void updateBestAsk();
+    void removeEmptyPriceLevel(Side side, Price price);
+    
+public:
+    OrderBook() = default;
+    
+    // Core operations
+    bool addOrder(Order* order, std::function<void(OrderID, Price, Quantity)> onTradeExecution);
+    bool cancelOrder(OrderID id);
+    
+    // Matching (to be implemented later with matching engine)
+    void match(Order* incoming_order, std::function<void(OrderID, Price, Quantity)> onTradeExecution);
+    
+    // Accessors
+    Price getBestBid() const;
+    Price getBestAsk() const;
+    Quantity getVolumeAtPrice(Side side, Price price) const;
+    Order* getOrder(OrderID id) const;
+    
+    // Check if order book can match (best bid >= best ask)
+    bool canMatch() const;
+    
+    // For debugging/display
+    void printBook() const;
+    size_t getBidLevelCount() const { return bids.size(); }
+    size_t getAskLevelCount() const { return asks.size(); }
+
+    // JSON snapshot for UI: top N price levels each side + top-of-book cache fields
+    std::string snapshot_top_json(std::size_t max_levels, std::uint32_t connections) const;
+};
+
+================================================================================
+FILE: src\price_level.cpp
+================================================================================
+#include "price_level.hpp"
+
+// new order arrives we add it to the back (FIFO)
+void PriceLevel::add(Order* order) {
+    if (!order) return;
+
+    if (head == nullptr) {
+        head = order;
+        tail = order;
+        order->prev = nullptr;
+        order->next = nullptr;
+    } else {
+        order->prev = tail;
+        tail->next = order;
+        order->next = nullptr;
+        tail = order;
+    }
+    total_volume += order->qty;
+}
+
+void PriceLevel::remove(Order* order){
+    if (!order) return;
+
+    if (order->next != nullptr) {
+        order->next->prev = order->prev;
+    } else {
+        tail = order->prev;
+    }
+
+    if (order->prev != nullptr) {
+        order->prev->next = order->next;
+    } else {
+        head = order->next;
+    }
+
+    total_volume -= order->qty;
+
+    order->next = nullptr;
+    order->prev = nullptr;
+
+}
+
+================================================================================
+FILE: src\order_book.cpp
+================================================================================
+#include "order_book.hpp"
+#include "types.hpp"
+#include <iostream>
+#include <functional>
+#include <sstream>
+
+bool OrderBook::addOrder(Order* order, std::function<void(OrderID, Price, Quantity)> onTradeExecution) {
+    std::lock_guard<std::recursive_mutex> lock(book_mutex);
+    if (!order || order->qty <= 0) return false;
+    
+    // Check if order ID already exists
+    if (order_map.find(order->id) != order_map.end()) return false;
+    
+    // 1. Fill-Or-Kill (FOK) Check
+    if (order->tif == TimeInForce::FOK) {
+        Quantity available_qty = 0;
+        if (order->side == Side::BUY) {
+            for (auto it = asks.begin(); it != asks.end(); ++it) {
+                if (order->type == OrderType::LIMIT && it->first > order->price) break;
+                available_qty += it->second.total_volume;
+                if (available_qty >= order->qty) break;
+            }
+        } else {
+            for (auto it = bids.begin(); it != bids.end(); ++it) {
+                if (order->type == OrderType::LIMIT && it->first < order->price) break;
+                available_qty += it->second.total_volume;
+                if (available_qty >= order->qty) break;
+            }
+        }
+        
+        // If not enough liquidity, kill the order immediately
+        if (available_qty < order->qty) {
+            // Cancelled
+            return false;
+        }
+    }
+
+    // 2. Immediate Matching for Market/IOC/FOK & Crossing Limits
+    while (order->qty > 0) {
+        Price match_price = 0;
+        Order* resting_order = nullptr;
+        
+        if (order->side == Side::BUY) {
+            if (asks.empty()) break;
+            auto best_ask = asks.begin();
+            if (order->type == OrderType::LIMIT && best_ask->first > order->price) break; // Limit not met
+            
+            resting_order = best_ask->second.head;
+            match_price = best_ask->first;
+        } else {
+            if (bids.empty()) break;
+            auto best_bid = bids.begin();
+            if (order->type == OrderType::LIMIT && best_bid->first < order->price) break; // Limit not met
+            
+            resting_order = best_bid->second.head;
+            match_price = best_bid->first;
+        }
+        
+        // Execute Trade
+        Quantity fill_qty = std::min(order->qty, resting_order->qty);
+        
+        if (onTradeExecution) {
+            onTradeExecution(order->id, match_price, fill_qty);
+            onTradeExecution(resting_order->id, match_price, fill_qty);
+        }
+        
+        order->qty -= fill_qty;
+        resting_order->qty -= fill_qty;
+        
+        // Remove filled resting order
+        if (resting_order->qty == 0) {
+            if (order->side == Side::BUY) {
+                asks.begin()->second.remove(resting_order);
+                order_map.erase(resting_order->id);
+                OrderPool::getInstance().release(resting_order);
+                if (asks.begin()->second.isEmpty()) {
+                    asks.erase(asks.begin());
+                    updateBestAsk();
+                }
+            } else {
+                bids.begin()->second.remove(resting_order);
+                order_map.erase(resting_order->id);
+                OrderPool::getInstance().release(resting_order);
+                if (bids.begin()->second.isEmpty()) {
+                    bids.erase(bids.begin());
+                    updateBestBid();
+                }
+            }
+        }
+    }
+    
+    // 3. Handle Remaining Quantity
+    if (order->qty > 0) {
+        if (order->type == OrderType::MARKET || order->tif == TimeInForce::IOC) {
+            // Market orders and IOCs do not rest on the book. Unfilled portion is cancelled.
+            return true; // Partially or entirely "failed to fill" but successfully processed
+        }
+    
+        // Add remaining limit order to the book
+        Price price = order->price;
+        
+        if (order->side == Side::BUY) {
+            if (bids.find(price) == bids.end()) bids[price] = PriceLevel(price);
+            bids[price].add(order);
+            if (price > best_bid_price) best_bid_price = price;
+        } else { // SELL
+            if (asks.find(price) == asks.end()) asks[price] = PriceLevel(price);
+            asks[price].add(order);
+            if (price < best_ask_price) best_ask_price = price;
+        }
+        
+        order_map[order->id] = order;
+    }
+    
+    return true;
+}
+
+bool OrderBook::cancelOrder(OrderID id) {
+    std::lock_guard<std::recursive_mutex> lock(book_mutex);
+    // O(1) lookup in hash map
+    auto it = order_map.find(id);
+    if (it == order_map.end()) return false;
+    
+    Order* order = it->second;
+    Price price = order->price;
+    
+    if (order->side == Side::BUY) {
+        auto level_it = bids.find(price);
+        if (level_it != bids.end()) {
+            level_it->second.remove(order);
+            
+            // Remove price level if empty
+            if (level_it->second.isEmpty()) {
+                bids.erase(level_it);
+                if (price == best_bid_price) {
+                    updateBestBid();
+                }
+            }
+        }
+    } else { // SELL
+        auto level_it = asks.find(price);
+        if (level_it != asks.end()) {
+            level_it->second.remove(order);
+            
+            if (level_it->second.isEmpty()) {
+                asks.erase(level_it);
+                if (price == best_ask_price) {
+                    updateBestAsk();
+                }
+            }
+        }
+    }
+    
+    order_map.erase(it);
+    return true;
+}
+
+void OrderBook::updateBestBid() {
+    if (bids.empty()) {
+        best_bid_price = 0;
+    } else {
+        // std::map with std::greater keeps highest price at begin()
+        best_bid_price = bids.begin()->first;
+    }
+}
+
+void OrderBook::updateBestAsk() {
+    if (asks.empty()) {
+        best_ask_price = INT64_MAX;
+    } else {
+        // std::map with std::less keeps lowest price at begin()
+        best_ask_price = asks.begin()->first;
+    }
+}
+
+bool OrderBook::canMatch() const {
+    return !bids.empty() && !asks.empty() && best_bid_price >= best_ask_price;
+}
+
+Price OrderBook::getBestBid() const {
+    return best_bid_price;
+}
+
+Price OrderBook::getBestAsk() const {
+    return best_ask_price;
+}
+
+Quantity OrderBook::getVolumeAtPrice(Side side, Price price) const {
+    if (side == Side::BUY) {
+        auto it = bids.find(price);
+        if (it != bids.end()) {
+            return it->second.total_volume;
+        }
+    } else {
+        auto it = asks.find(price);
+        if (it != asks.end()) {
+            return it->second.total_volume;
+        }
+    }
+    return 0;
+}
+
+Order* OrderBook::getOrder(OrderID id) const {
+    auto it = order_map.find(id);
+    if (it != order_map.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+std::string OrderBook::snapshot_top_json(std::size_t max_levels, std::uint32_t connections) const {
+    std::lock_guard<std::recursive_mutex> lock(book_mutex);
+
+    std::ostringstream oss;
+    oss << "{\"type\":\"book\",\"connections\":" << connections
+        << ",\"best_bid_cached\":" << best_bid_price << ",\"best_ask_cached\":";
+    if (best_ask_price == NO_ASK) {
+        oss << "null";
+    } else {
+        oss << best_ask_price;
+    }
+    oss << ",\"best_bid\":" << best_bid_price << ",\"best_ask\":";
+    if (best_ask_price == NO_ASK) {
+        oss << "null";
+    } else {
+        oss << best_ask_price;
+    }
+
+    oss << ",\"bids\":[";
+    {
+        std::size_t i = 0;
+        for (auto it = bids.begin(); it != bids.end() && i < max_levels; ++it, ++i) {
+            if (i) oss << ',';
+            oss << "{\"price\":" << it->first << ",\"qty\":" << it->second.total_volume << "}";
+        }
+    }
+    oss << "],\"asks\":[";
+    {
+        std::size_t i = 0;
+        for (auto it = asks.begin(); it != asks.end() && i < max_levels; ++it, ++i) {
+            if (i) oss << ',';
+            oss << "{\"price\":" << it->first << ",\"qty\":" << it->second.total_volume << "}";
+        }
+    }
+    oss << "]}";
+    return oss.str();
+}
+
+void OrderBook::printBook() const {
+    std::cout << "=== ORDER BOOK ===" << std::endl;
+    
+    std::cout << "ASKS (sell orders):" << std::endl;
+    for (auto it = asks.rbegin(); it != asks.rend(); ++it) {
+        std::cout << "  $" << it->first / 100.0 << " : " 
+                  << it->second.total_volume << " shares" << std::endl;
+    }
+    
+    std::cout << "-------------------" << std::endl;
+    
+    std::cout << "BIDS (buy orders):" << std::endl;
+    for (const auto& [price, level] : bids) {
+        std::cout << "  $" << price / 100.0 << " : " 
+                  << level.total_volume << " shares" << std::endl;
+    }
+}
+
+================================================================================
+FILE: src\main.cpp
+================================================================================
+#include "crow_all.h"
+#include "order_book.hpp"
+#include <iostream>
+#include <string>
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <set>
+#include <sstream>
+
+// Store active connections to broadcast trade reports
+std::mutex connections_mutex;
+std::set<crow::websocket::connection*> active_connections;
+
+static void broadcast_text(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(connections_mutex);
+    for (auto* current_conn : active_connections) {
+        current_conn->send_text(msg);
+    }
+}
+
+int main() {
+    crow::SimpleApp app;
+    OrderBook book;
+
+    std::atomic<uint64_t> global_order_id{1};
+
+    auto broadcast_book = [&]() {
+        std::uint32_t n = 0;
+        {
+            std::lock_guard<std::mutex> lock(connections_mutex);
+            n = static_cast<std::uint32_t>(active_connections.size());
+        }
+        std::string j = book.snapshot_top_json(10, n);
+        broadcast_text(j);
+    };
+
+    auto broadcast_fill = [&](OrderID order_id, Price match_price, Quantity fill_qty) {
+        std::ostringstream oss;
+        oss << "{\"type\":\"fill\",\"order_id\":" << order_id << ",\"price\":" << match_price
+            << ",\"qty\":" << fill_qty << "}";
+        broadcast_text(oss.str());
+    };
+
+    CROW_WEBSOCKET_ROUTE(app, "/ws")
+        .onopen([&](crow::websocket::connection& conn) {
+            {
+                std::lock_guard<std::mutex> lock(connections_mutex);
+                active_connections.insert(&conn);
+            }
+            std::cout << "New trader connected!" << std::endl;
+            broadcast_book();
+        })
+        .onclose([&](crow::websocket::connection& conn, const std::string& reason, uint16_t code) {
+            std::lock_guard<std::mutex> lock(connections_mutex);
+            active_connections.erase(&conn);
+            std::cout << "Trader disconnected." << std::endl;
+        })
+        .onmessage([&](crow::websocket::connection& conn, const std::string& data, bool is_binary) {
+            auto incoming_json = crow::json::load(data);
+            if (!incoming_json) {
+                conn.send_text("{\"type\":\"error\",\"message\":\"Invalid JSON format\"}");
+                return;
+            }
+
+            if (incoming_json.has("type")) {
+                try {
+                    if (incoming_json["type"].s() == "client_ping") {
+                        int64_t id = 0;
+                        if (incoming_json.has("id")) {
+                            id = incoming_json["id"].i();
+                        }
+                        std::ostringstream pong;
+                        pong << "{\"type\":\"client_pong\",\"id\":" << id << "}";
+                        conn.send_text(pong.str());
+                        return;
+                    }
+                } catch (...) {
+                    // "type" exists but is not a string (e.g. numeric); fall through to order handling
+                }
+            }
+
+            if (incoming_json.has("action") && incoming_json["action"].s() == "cancel") {
+                if (incoming_json.has("id")) {
+                    OrderID id = static_cast<OrderID>(incoming_json["id"].i());
+                    bool success = book.cancelOrder(id);
+                    if (success) {
+                        conn.send_text("{\"type\":\"cancel_result\",\"success\":true,\"id\":" + std::to_string(id) + "}");
+                    } else {
+                        conn.send_text("{\"type\":\"cancel_result\",\"success\":false,\"id\":" + std::to_string(id) + "}");
+                    }
+                    broadcast_book();
+                }
+                return;
+            }
+
+            try {
+                std::string side_str = incoming_json["side"].s();
+                Price price = incoming_json.has("price") ? incoming_json["price"].i() : 0;
+                Quantity qty = incoming_json["qty"].i();
+
+                std::string type_str = "LIMIT";
+                if (incoming_json.has("type")) type_str = incoming_json["type"].s();
+
+                std::string tif_str = "GTC";
+                if (incoming_json.has("tif")) tif_str = incoming_json["tif"].s();
+
+                Side side = (side_str == "BUY" || side_str == "buy") ? Side::BUY : Side::SELL;
+                OrderType type = (type_str == "MARKET" || type_str == "market") ? OrderType::MARKET : OrderType::LIMIT;
+
+                TimeInForce tif = TimeInForce::GTC;
+                if (tif_str == "IOC" || tif_str == "ioc") tif = TimeInForce::IOC;
+                if (tif_str == "FOK" || tif_str == "fok") tif = TimeInForce::FOK;
+
+                uint64_t id = global_order_id.fetch_add(1);
+
+                Order* o = OrderPool::getInstance().acquire();
+                o->id = id;
+                o->side = side;
+                o->type = type;
+                o->tif = tif;
+                o->price = price;
+                o->qty = qty;
+
+                auto trade_callback = [&](OrderID order_id, Price match_price, Quantity fill_qty) {
+                    broadcast_fill(order_id, match_price, fill_qty);
+                    broadcast_book();
+                };
+
+                bool success = book.addOrder(o, trade_callback);
+
+                if (success) {
+                    conn.send_text("{\"type\":\"ack\",\"order_id\":" + std::to_string(id) + ",\"status\":\"accepted\"}");
+                    if (o->qty == 0 || o->type == OrderType::MARKET || o->tif == TimeInForce::IOC) {
+                        if (o->qty > 0) {
+                            conn.send_text("{\"type\":\"ack\",\"order_id\":" + std::to_string(id) +
+                                           ",\"status\":\"ioc_market_remainder\",\"remaining_qty\":" +
+                                           std::to_string(o->qty) + "}");
+                        }
+                        OrderPool::getInstance().release(o);
+                    }
+                } else {
+                    conn.send_text("{\"type\":\"error\",\"message\":\"FOK not satisfied or addOrder failed\"}");
+                    OrderPool::getInstance().release(o);
+                }
+                broadcast_book();
+            } catch (const std::exception& e) {
+                conn.send_text("{\"type\":\"error\",\"message\":\"Missing required fields (side, qty)\"}");
+            }
+        });
+
+    std::cout << "Matching Engine starting on port 8080..." << std::endl;
+
+    app.port(8080).multithreaded().run();
+}
+
+================================================================================
+FILE: tests\test_matching.cpp
+================================================================================
+
+
+================================================================================
+FILE: scripts\invest_expand_optimize.py
+================================================================================
+"""
+Invest & Expand — optimal Research/Scale given Speed, plus opponent simulations.
+
+PnL = research(r) * scale(s) * hit_rate_mult - BUDGET
+research(x) = RESEARCH_MAX * log(1+x) / log(1+100)
+scale(x) = SCALE_MAX * x / 100
+Constraint: r + s + v = 100 (percentages), x in [0, 100] for pillar inputs.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import skewnorm
+
+BUDGET = 50_000.0
+RESEARCH_MAX = 200_000.0
+SCALE_MAX = 7.0
+LOG101 = np.log(101.0)
+N_OPPONENTS = 1000
+N_DISTRIBUTIONS = 100
+N_LOGNORMAL_SCENARIOS = 1000
+RNG_SEED = 42
+
+
+def research(pct: np.ndarray) -> np.ndarray:
+    pct = np.asarray(pct, dtype=np.float64)
+    return RESEARCH_MAX * np.log1p(pct) / LOG101
+
+
+def scale(pct: np.ndarray) -> np.ndarray:
+    pct = np.asarray(pct, dtype=np.float64)
+    return SCALE_MAX * pct / 100.0
+
+
+def newton_r_given_v(
+    v: float,
+    *,
+    iters: int = 4,
+    x0: float | None = None,
+) -> float:
+    """
+    Solve (100 - v - r) = (1 + r) * ln(1 + r) for r in [0, 100 - v].
+    Equivalent root: f(r) = v - 100 + r + (1+r)*ln(1+r) = 0.
+    f'(r) = 2 + ln(1+r).
+    """
+    cap = max(0.0, 100.0 - v)
+    if cap <= 0.0:
+        return 0.0
+
+    r = 23.0 - 0.2 * v if x0 is None else float(x0)
+    r = np.clip(r, 0.0, cap)
+
+    for _ in range(iters):
+        rp1 = 1.0 + r
+        f = v - 100.0 + r + rp1 * np.log(rp1)
+        fp = 2.0 + np.log(rp1)
+        if fp == 0.0:
+            break
+        r = r - f / fp
+        r = np.clip(r, 0.0, cap)
+    return float(r)
+
+
+def competition_ranks(values: np.ndarray) -> np.ndarray:
+    """
+    Competition ranking (1-based): ties share rank; next rank skips.
+    Example: [70,70,70,50] -> [1,1,1,4]
+    """
+    values = np.asarray(values, dtype=np.float64).ravel()
+    n = values.size
+    order = np.argsort(-values, kind="mergesort")
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order[0]] = 1.0
+    for i in range(1, n):
+        idx = order[i]
+        prev = order[i - 1]
+        if values[idx] == values[prev]:
+            ranks[idx] = ranks[prev]
+        else:
+            ranks[idx] = float(i + 1)
+    return ranks
+
+
+def hit_rate_from_rank(rank: float, worst_rank: float) -> float:
+    """Linear from 0.9 at best (rank 1) to 0.1 at worst_rank."""
+    if worst_rank <= 1.0:
+        return 0.9
+    t = (rank - 1.0) / (worst_rank - 1.0)
+    return 0.9 - 0.8 * t
+
+
+def build_allocation_table(
+    v_step: float = 0.1,
+    *,
+    newton_iters: int = 4,
+) -> pd.DataFrame:
+    """Optimal r,s for each speed v; PnL columns for hit-rate multiples 0.1..0.9."""
+    vs = np.arange(0.0, 100.0 + 1e-9, v_step)
+    rows = []
+    mults = np.round(np.arange(0.1, 1.0, 0.1), 1)
+
+    for v in vs:
+        v = float(np.round(v, 10))
+        r = newton_r_given_v(v, iters=newton_iters)
+        s = 100.0 - r - v
+        s = max(0.0, s)
+        rv = research(np.array([r]))[0]
+        sv = scale(np.array([s]))[0]
+        gross_base = rv * sv
+        row = {
+            "speed_pct": v,
+            "research_pct": r,
+            "scale_pct": s,
+            "research_value": rv,
+            "scale_value": sv,
+            "gross_research_times_scale": gross_base,
+        }
+        for m in mults:
+            row[f"pnl_mult_{m:.1f}"] = gross_base * m - BUDGET
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def hit_rate_us_first(all_speeds: np.ndarray) -> float:
+    """
+    Rank-based hit rate; linear 0.9 (best) .. 0.1 (worst).
+    Caller must put our speed in all_speeds[0]; opponents follow.
+    """
+    all_speeds = np.asarray(all_speeds, dtype=np.float64).ravel()
+    ranks = competition_ranks(all_speeds)
+    worst = float(all_speeds.size)
+    return hit_rate_from_rank(float(ranks[0]), worst)
+
+
+def normal_scenarios() -> list[dict[str, float | str]]:
+    """
+    100 (mu, sigma) pairs on a 10x10 grid; mu +/- 3*sigma in [0, 100].
+    Opponents drawn N(mu, sigma), clipped to [0, 100].
+    """
+    mus = np.linspace(22.0, 78.0, 10)
+    sigs = np.linspace(3.0, 7.0, 10)
+    rows: list[dict[str, float | str]] = []
+    for mu in mus:
+        for sig in sigs:
+            if mu - 3.0 * sig < -1e-9 or mu + 3.0 * sig > 100.0 + 1e-9:
+                continue
+            m, s = float(mu), float(sig)
+            rows.append(
+                {
+                    "distribution": f"Normal({m:.2f},{s:.2f})",
+                    "opp_mean": m,
+                    "opp_std": s,
+                }
+            )
+    if len(rows) != N_DISTRIBUTIONS:
+        raise RuntimeError(f"normal: expected {N_DISTRIBUTIONS} scenarios, got {len(rows)}")
+    return rows
+
+
+def sample_normal_opponents(sc: dict[str, float | str], rng: np.random.Generator) -> np.ndarray:
+    opp = rng.normal(float(sc["opp_mean"]), float(sc["opp_std"]), size=N_OPPONENTS)
+    return np.clip(opp, 0.0, 100.0)
+
+
+def lognormal_scenarios() -> list[dict[str, float | str]]:
+    """
+    Opponent draws X ~ LogNormal with ln X ~ N(mu_ln, sigma_ln^2), then clip to [0, 100].
+
+    Instead of gridding mu_ln directly (which mostly produced very low *level* means on
+    [0, 100]), we grid an approximate **pre-clip mean** ``target_mean`` on the same scale
+    as the other families (~15–85) and set
+
+        mu_ln = ln(target_mean) - sigma_ln^2 / 2
+
+    so E[X] = target_mean for the underlying lognormal. Pairs are kept only if roughly
+    99.9% of mass sits below 100: mu_ln + 3*sigma_ln <= ln(100) - eps.
+
+    We take N_LOGNORMAL_SCENARIOS points **evenly spaced through the sorted valid list**
+    (by target_mean, then sigma) so scenario means vary smoothly from low to high.
+    """
+    log_cap = np.log(100.0) - 0.02
+    triples: list[tuple[float, float, float]] = []
+    # Wide mean range, aligned with Normal/SkewNormal-style centers; sigma includes small
+    # values so high means remain feasible under the upper-tail cap.
+    for m_tgt in np.linspace(14.0, 86.0, 72):
+        for sig in np.linspace(0.05, 0.50, 72):
+            m_tgt = float(m_tgt)
+            sig = float(sig)
+            if m_tgt <= 0.0:
+                continue
+            mu_ln = float(np.log(m_tgt) - 0.5 * sig * sig)
+            if mu_ln + 3.0 * sig > log_cap:
+                continue
+            triples.append((m_tgt, mu_ln, sig))
+
+    triples.sort(key=lambda t: (t[0], t[2]))
+    n_tri = len(triples)
+    if n_tri < N_LOGNORMAL_SCENARIOS:
+        raise RuntimeError(
+            f"lognormal: need {N_LOGNORMAL_SCENARIOS} scenarios, got {n_tri}; widen grid"
+        )
+    sel = (
+        np.arange(N_LOGNORMAL_SCENARIOS, dtype=np.float64)
+        * (n_tri - 1)
+        / max(N_LOGNORMAL_SCENARIOS - 1, 1)
+    )
+    sel = np.round(sel).astype(np.int64)
+    chosen = [triples[int(i)] for i in sel]
+
+    return [
+        {
+            "distribution": f"LogNormal(E≈{m:.1f},σ_ln={sig:.2f})",
+            "param_target_mean": m,
+            "param_mu_ln": mu_ln,
+            "param_sigma_ln": sig,
+        }
+        for m, mu_ln, sig in chosen
+    ]
+
+
+def sample_lognormal_opponents(sc: dict[str, float | str], rng: np.random.Generator) -> np.ndarray:
+    opp = rng.lognormal(float(sc["param_mu_ln"]), float(sc["param_sigma_ln"]), size=N_OPPONENTS)
+    return np.clip(opp, 0.0, 100.0)
+
+
+def geometric_scenarios() -> list[dict[str, float | str]]:
+    """
+    (G - 1) * scale, G ~ Geometric(p) on {1,2,...} (NumPy parameterization), clipped to [0, 100].
+    100 (p, scale) pairs; tails clipped so almost all mass in [0, 100] for typical draws.
+    """
+    ps = np.linspace(0.035, 0.20, 10)
+    scales = np.linspace(2.5, 16.0, 10)
+    rows: list[dict[str, float | str]] = []
+    for p in ps:
+        for sc in scales:
+            pf, sf = float(p), float(sc)
+            rows.append(
+                {
+                    "distribution": f"Geom(p={pf:.3f},scale={sf:.2f})",
+                    "param_geom_p": pf,
+                    "param_geom_scale": sf,
+                }
+            )
+    if len(rows) != N_DISTRIBUTIONS:
+        raise RuntimeError(f"geometric: expected {N_DISTRIBUTIONS} scenarios, got {len(rows)}")
+    return rows
+
+
+def sample_geometric_opponents(sc: dict[str, float | str], rng: np.random.Generator) -> np.ndarray:
+    g = rng.geometric(float(sc["param_geom_p"]), size=N_OPPONENTS)
+    raw = (g - 1).astype(np.float64) * float(sc["param_geom_scale"])
+    return np.clip(raw, 0.0, 100.0)
+
+
+def left_skew_normal_scenarios() -> list[dict[str, float | str]]:
+    """
+    Skew-normal with a < 0 (left / negative skew). loc, scale chosen so bulk lies in [0, 100];
+    samples clipped to [0, 100].
+    """
+    alphas = np.linspace(-12.0, -2.0, 10)
+    mus = np.linspace(32.0, 68.0, 10)
+    sig = 7.0
+    rows: list[dict[str, float | str]] = []
+    for a in alphas:
+        for mu in mus:
+            af, mf = float(a), float(mu)
+            rows.append(
+                {
+                    "distribution": f"SkewNormal(a={af:.1f},loc={mf:.1f},scale={sig:.1f})",
+                    "param_skew_a": af,
+                    "param_skew_loc": mf,
+                    "param_skew_scale": float(sig),
+                }
+            )
+    if len(rows) != N_DISTRIBUTIONS:
+        raise RuntimeError(f"skew-normal: expected {N_DISTRIBUTIONS} scenarios, got {len(rows)}")
+    return rows
+
+
+def sample_skewnormal_opponents(sc: dict[str, float | str], rng: np.random.Generator) -> np.ndarray:
+    opp = skewnorm.rvs(
+        float(sc["param_skew_a"]),
+        loc=float(sc["param_skew_loc"]),
+        scale=float(sc["param_skew_scale"]),
+        size=N_OPPONENTS,
+        random_state=rng,
+    )
+    return np.clip(np.asarray(opp, dtype=np.float64), 0.0, 100.0)
+
+
+def run_scenarios(
+    table: pd.DataFrame,
+    rng: np.random.Generator,
+    scenarios: list[dict[str, float | str]],
+    sample_opponents: Callable[[dict[str, float | str], np.random.Generator], np.ndarray],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    For each scenario, draw opponents, search best our speed on the allocation table.
+    Returns (per_scenario_df, aggregate_df).
+    """
+    v_col = table["speed_pct"].to_numpy()
+    r_col = table["research_pct"].to_numpy()
+    s_col = table["scale_pct"].to_numpy()
+    gross = table["gross_research_times_scale"].to_numpy()
+
+    summaries: list[dict[str, float | str]] = []
+
+    for sc in scenarios:
+        opp = sample_opponents(sc, rng)
+        emp_mean = float(np.mean(opp))
+        emp_std = float(np.std(opp))
+
+        best_v = 0.0
+        best_pnl = -np.inf
+        best_mult = 0.0
+        best_i = 0
+
+        for i, v in enumerate(v_col):
+            ours = np.concatenate([[v], opp])
+            mult = hit_rate_us_first(ours)
+            pnl = gross[i] * mult - BUDGET
+            if pnl > best_pnl:
+                best_pnl = pnl
+                best_v = float(v)
+                best_mult = float(mult)
+                best_i = i
+
+        row: dict[str, float | str] = {**sc}
+        row["opp_mean_empirical"] = emp_mean
+        row["opp_std_empirical"] = emp_std
+        row["best_speed_pct"] = best_v
+        row["best_research_pct"] = float(r_col[best_i])
+        row["best_scale_pct"] = float(s_col[best_i])
+        row["implied_hit_rate"] = best_mult
+        row["best_pnl"] = float(best_pnl)
+        summaries.append(row)
+
+    sim_df = pd.DataFrame(summaries)
+    agg_row: dict[str, float | str] = {"distribution": "AGGREGATE (mean over sims)"}
+    for c in sim_df.columns:
+        if c == "distribution":
+            continue
+        agg_row[c] = float(sim_df[c].mean())
+    agg = pd.DataFrame([agg_row])
+    agg = agg[sim_df.columns]
+    return sim_df, agg
+
+
+def run_simulations(
+    table: pd.DataFrame,
+    rng: np.random.Generator,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Backward-compatible: Gaussian opponents (same as before, plus empirical opp stats)."""
+    return run_scenarios(table, rng, normal_scenarios(), sample_normal_opponents)
+
+
+def main() -> None:
+    rng = np.random.default_rng(RNG_SEED)
+
+    table = build_allocation_table(v_step=0.1, newton_iters=4)
+    out_dir = Path(__file__).resolve().parent
+    table_path = out_dir / "invest_expand_allocation_table.csv"
+    table.to_csv(table_path, index=False)
+
+    sim_df, agg = run_simulations(table, rng)
+    sim_full = pd.concat([sim_df, agg], ignore_index=True)
+    sim_path = out_dir / "invest_expand_simulation_results.csv"
+    sim_full.to_csv(sim_path, index=False)
+
+    # Separate streams so each output file is reproducible regardless of run order.
+    ln_df, ln_agg = run_scenarios(
+        table,
+        np.random.default_rng(RNG_SEED + 1),
+        lognormal_scenarios(),
+        sample_lognormal_opponents,
+    )
+    (pd.concat([ln_df, ln_agg], ignore_index=True)).to_csv(
+        out_dir / "invest_expand_simulation_lognormal.csv", index=False
+    )
+
+    geom_df, geom_agg = run_scenarios(
+        table,
+        np.random.default_rng(RNG_SEED + 2),
+        geometric_scenarios(),
+        sample_geometric_opponents,
+    )
+    (pd.concat([geom_df, geom_agg], ignore_index=True)).to_csv(
+        out_dir / "invest_expand_simulation_geometric.csv", index=False
+    )
+
+    skew_df, skew_agg = run_scenarios(
+        table,
+        np.random.default_rng(RNG_SEED + 3),
+        left_skew_normal_scenarios(),
+        sample_skewnormal_opponents,
+    )
+    (pd.concat([skew_df, skew_agg], ignore_index=True)).to_csv(
+        out_dir / "invest_expand_simulation_left_skew_normal.csv", index=False
+    )
+
+    print(f"Wrote {table_path} ({len(table)} rows)")
+    print(f"Wrote {sim_path} ({len(sim_full)} rows)")
+    print(f"Wrote {out_dir / 'invest_expand_simulation_lognormal.csv'} ({len(ln_df) + 1} rows)")
+    print(f"Wrote {out_dir / 'invest_expand_simulation_geometric.csv'} ({len(geom_df) + 1} rows)")
+    print(f"Wrote {out_dir / 'invest_expand_simulation_left_skew_normal.csv'} ({len(skew_df) + 1} rows)")
+    print("\nFirst 5 allocation rows:")
+    print(table.head().to_string())
+    print("\nLast 3 simulation rows (incl. aggregate):")
+    print(sim_full.tail(3).to_string())
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: desktop-ui\Cargo.toml
+================================================================================
+[workspace]
+resolver = "2"
+members = ["ui", "src-tauri"]
+
+================================================================================
+FILE: desktop-ui\README.md
+================================================================================
+# OES Desktop (Tauri + Leptos)
+
+Desktop execution UI for the C++ matching engine in the parent repo. The Tauri backend maintains a **Tokio** WebSocket client to `ws://127.0.0.1:8080/ws`, parses JSON pushed by the engine, **throttles book/midpoint commits to ~60Hz**, and exposes state via **`get_ui_state`**. The Leptos CSR frontend polls that command on a **~16ms** interval and updates **fine-grained signals** (ladder, chart, health, order entry). The midpoint chart uses **elapsed seconds since the bridge started** on the X axis and **midpoint = (best bid + best ask) / 2** (display dollars, fixed-point ÷ 100) on the Y axis; fills are overlaid at their wall time.
+
+## Prerequisites
+
+- Rust stable + `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
+- [Trunk](https://trunkrs.dev/) (`cargo install trunk`)
+- C++ engine built and listening on **port 8080** (`make` in repo root → `bin/oes_engine`)
+
+## Dev workflow (two terminals)
+
+1. **Engine:** from repo root, run `./bin/oes_engine` (or Windows equivalent).
+2. **UI assets:** `cd desktop-ui/ui` then `trunk serve` (serves on **http://127.0.0.1:1420** — avoids clashing with the engine on 8080).
+3. **Shell:** `cd desktop-ui/src-tauri` then `cargo tauri dev`.
+
+`tauri.conf.json` points `devUrl` at `http://127.0.0.1:1420` and `frontendDist` at `../ui/dist` for release builds (`trunk build --release` in `ui/` first).
+
+## Engine protocol (JSON)
+
+The engine emits structured lines (see `src/main.cpp` in the parent repo):
+
+- `{"type":"book", ...}` — top-of-book + top 10 bid/ask levels, `connections`, cached best bid/ask.
+- `{"type":"fill", ...}` — trade prints for chart markers.
+- `{"type":"ack", ...}` / `{"type":"error", ...}` / `{"type":"cancel_result", ...}` — order lifecycle.
+- `{"type":"client_pong", ...}` — latency measurement for `client_ping`.
+
+## Tailwind
+
+The UI uses the **Tailwind Play CDN** in `ui/index.html` for a low-light Bloomberg-style palette (see `tailwind.config` inline script).
+
+## Notes
+
+- If Tauri **capability / permission** errors appear on `invoke`, widen `src-tauri/capabilities/default.json` per your installed Tauri 2.x docs.
+- Price display uses **÷ 100** to match the engine’s fixed-point convention used in `main.cpp` trade strings.
+
+================================================================================
+FILE: desktop-ui\src-tauri\Cargo.toml
+================================================================================
+[package]
+name = "oes-desktop"
+version = "0.1.0"
+description = "OES desktop — Tauri bridge to C++ matching engine"
+authors = ["OES"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
+tungstenite = { version = "0.24", default-features = true }
+
+================================================================================
+FILE: desktop-ui\src-tauri\build.rs
+================================================================================
+fn main() {
+    tauri_build::build()
+}
+
+================================================================================
+FILE: desktop-ui\src-tauri\tauri.conf.json
+================================================================================
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OES Desktop",
+  "version": "0.1.0",
+  "identifier": "com.oes.desktop",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://127.0.0.1:1420"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "OES Desktop",
+        "width": 1320,
+        "height": 860,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  },
+  "plugins": {}
+}
+
+================================================================================
+FILE: desktop-ui\src-tauri\capabilities\default.json
+================================================================================
+{
+  "identifier": "default",
+  "description": "Main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
+
+================================================================================
+FILE: desktop-ui\src-tauri\src\main.rs
+================================================================================
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::State;
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::connect_async;
+
+const WS_URL: &str = "ws://127.0.0.1:8080/ws";
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct BookLevel {
+    pub price: i64,
+    pub qty: i32,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct BookSnapshot {
+    #[serde(rename = "type", default)]
+    pub msg_type: Option<String>,
+    #[serde(default)]
+    pub best_bid: i64,
+    pub best_ask: Option<i64>,
+    #[serde(default)]
+    pub best_bid_cached: Option<i64>,
+    pub best_ask_cached: Option<i64>,
+    #[serde(default)]
+    pub bids: Vec<BookLevel>,
+    #[serde(default)]
+    pub asks: Vec<BookLevel>,
+    pub connections: Option<u32>,
+}
+
+#[derive(Default, Clone, Serialize)]
+pub struct UiState {
+    pub book: Option<BookSnapshot>,
+    pub ws_connected: bool,
+    pub latency_ms: f64,
+    pub last_order_id: Option<u64>,
+    /// (t_sec, midpoint_price) — `t_sec` is seconds since the desktop bridge started
+    pub midpoint_series: Vec<(f64, f64)>,
+    /// (t_sec, last trade price) at fill time
+    pub fill_markers: Vec<(f64, f64)>,
+    pub toasts: Vec<String>,
+    pub engine_connections: u32,
+    pub best_bid_cached: Option<i64>,
+    pub best_ask_cached: Option<i64>,
+}
+
+struct Inner {
+    /// Wall clock for chart X axis (seconds since bridge created)
+    t0: Instant,
+    pending_book: Option<BookSnapshot>,
+    committed_book: Option<BookSnapshot>,
+    last_commit: Option<Instant>,
+    midpoint_series: Vec<(f64, f64)>,
+    fill_markers: Vec<(f64, f64)>,
+    last_order_id: Option<u64>,
+    ws_connected: bool,
+    latency_ms: f64,
+    ping_sent_at: Option<Instant>,
+    pending_toasts: Vec<String>,
+}
+
+impl Inner {
+    fn new() -> Self {
+        Self {
+            t0: Instant::now(),
+            pending_book: None,
+            committed_book: None,
+            last_commit: None,
+            midpoint_series: Vec::new(),
+            fill_markers: Vec::new(),
+            last_order_id: None,
+            ws_connected: false,
+            latency_ms: 0.0,
+            ping_sent_at: None,
+            pending_toasts: Vec::new(),
+        }
+    }
+
+    fn elapsed_chart_secs(&self) -> f64 {
+        self.t0.elapsed().as_secs_f64()
+    }
+
+    fn trim_time_series(&mut self) {
+        const WINDOW_SECS: f64 = 240.0;
+        let t_hi = self
+            .midpoint_series
+            .last()
+            .map(|(t, _)| *t)
+            .unwrap_or(0.0)
+            .max(
+                self.fill_markers
+                    .last()
+                    .map(|(t, _)| *t)
+                    .unwrap_or(0.0),
+            );
+        let cutoff = t_hi - WINDOW_SECS;
+        while let Some((t, _)) = self.midpoint_series.first() {
+            if *t < cutoff {
+                self.midpoint_series.remove(0);
+            } else {
+                break;
+            }
+        }
+        while let Some((t, _)) = self.fill_markers.first() {
+            if *t < cutoff {
+                self.fill_markers.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn price_to_f(p: i64) -> f64 {
+        p as f64 / 100.0
+    }
+
+    fn midpoint_from_book(b: &BookSnapshot) -> Option<f64> {
+        let ask = b.best_ask?;
+        if b.best_bid <= 0 || ask <= 0 || ask == i64::MAX {
+            return None;
+        }
+        Some((Self::price_to_f(b.best_bid) + Self::price_to_f(ask)) / 2.0)
+    }
+
+    fn commit_if_ready(&mut self, now: Instant) {
+        const FRAME: Duration = Duration::from_millis(16);
+        let due = self.pending_book.is_some()
+            && self
+                .last_commit
+                .map(|t| now.duration_since(t) >= FRAME)
+                .unwrap_or(true);
+        if !due {
+            return;
+        }
+        if let Some(b) = self.pending_book.take() {
+            self.committed_book = Some(b.clone());
+            self.last_commit = Some(now);
+            if let Some(mid) = Self::midpoint_from_book(&b) {
+                let t = self.elapsed_chart_secs();
+                self.midpoint_series.push((t, mid));
+                self.trim_time_series();
+            }
+        }
+    }
+
+    fn ingest_json_line(&mut self, text: &str) {
+        let v: serde_json::Value = match serde_json::from_str(text) {
+            Ok(v) => v,
+            Err(_) => {
+                self.pending_toasts
+                    .push("Non-JSON message from engine".into());
+                return;
+            }
+        };
+        let typ = v["type"].as_str().unwrap_or("");
+        match typ {
+            "book" => match serde_json::from_value::<BookSnapshot>(v) {
+                Ok(b) => {
+                    self.pending_book = Some(b);
+                }
+                Err(e) => self.pending_toasts.push(format!("book parse: {e}")),
+            },
+            "fill" => {
+                let price = v["price"].as_i64().unwrap_or(0);
+                let px = Self::price_to_f(price);
+                let t = self.elapsed_chart_secs();
+                self.fill_markers.push((t, px));
+                self.trim_time_series();
+            }
+            "ack" => {
+                if let Some(id) = v["order_id"].as_u64() {
+                    self.last_order_id = Some(id);
+                }
+            }
+            "cancel_result" => {
+                let ok = v["success"].as_bool().unwrap_or(false);
+                if !ok {
+                    self.pending_toasts.push("Cancel rejected by engine".into());
+                }
+            }
+            "error" => {
+                let msg = v["message"].as_str().unwrap_or("engine error");
+                self.pending_toasts.push(msg.to_string());
+            }
+            "client_pong" => {
+                if let Some(t0) = self.ping_sent_at.take() {
+                    self.latency_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot_ui(&mut self, now: Instant) -> UiState {
+        self.commit_if_ready(now);
+        let book = self.committed_book.clone();
+        let engine_connections = book.as_ref().and_then(|b| b.connections).unwrap_or(0);
+        let best_bid_cached = book.as_ref().and_then(|b| b.best_bid_cached).or_else(|| book.as_ref().map(|b| b.best_bid));
+        let best_ask_cached = book
+            .as_ref()
+            .and_then(|b| b.best_ask_cached)
+            .or_else(|| book.as_ref().and_then(|b| b.best_ask));
+        let toasts = std::mem::take(&mut self.pending_toasts);
+        UiState {
+            book,
+            ws_connected: self.ws_connected,
+            latency_ms: self.latency_ms,
+            last_order_id: self.last_order_id,
+            midpoint_series: self.midpoint_series.clone(),
+            fill_markers: self.fill_markers.clone(),
+            toasts,
+            engine_connections,
+            best_bid_cached,
+            best_ask_cached,
+        }
+    }
+}
+
+struct Bridge {
+    out_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    inner: Mutex<Inner>,
+}
+
+impl Bridge {
+    fn new() -> Self {
+        Self {
+            out_tx: Mutex::new(None),
+            inner: Mutex::new(Inner::new()),
+        }
+    }
+
+    fn set_out_tx(&self, tx: Option<mpsc::UnboundedSender<String>>) {
+        *self.out_tx.lock().expect("bridge lock") = tx;
+    }
+
+    fn send_line(&self, line: String) -> Result<(), String> {
+        let g = self.out_tx.lock().map_err(|_| "bridge lock poisoned")?;
+        let tx = g.as_ref().ok_or_else(|| "engine socket not connected".to_string())?;
+        tx.send(line).map_err(|_| "engine socket closed".to_string())
+    }
+}
+
+async fn engine_loop(bridge: Arc<Bridge>) {
+    loop {
+        match connect_async(WS_URL).await {
+            Ok((ws, _)) => {
+                {
+                    let mut inner = bridge.inner.lock().expect("inner");
+                    inner.ws_connected = true;
+                }
+                let (mut write, mut read) = ws.split();
+                let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+                bridge.set_out_tx(Some(tx));
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        out = rx.recv() => {
+                            match out {
+                                Some(msg) => {
+                                    if write.send(Message::Text(msg)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        inc = read.next() => {
+                            match inc {
+                                Some(Ok(Message::Text(t))) => {
+                                    let mut inner = bridge.inner.lock().expect("inner");
+                                    inner.ingest_json_line(&t);
+                                }
+                                Some(Ok(Message::Ping(p))) => {
+                                    let _ = write.send(Message::Pong(p)).await;
+                                }
+                                Some(Ok(Message::Close(_))) | None => break,
+                                Some(Err(_)) => break,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                bridge.set_out_tx(None);
+                let mut inner = bridge.inner.lock().expect("inner");
+                inner.ws_connected = false;
+                inner
+                    .pending_toasts
+                    .push("WebSocket disconnected — reconnecting…".into());
+            }
+            Err(_) => {
+                let mut inner = bridge.inner.lock().expect("inner");
+                inner.ws_connected = false;
+                inner.pending_toasts.push(format!(
+                    "Cannot connect to engine at {WS_URL} (is oes_engine running?)"
+                ));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[tauri::command]
+fn get_ui_state(bridge: State<'_, Arc<Bridge>>) -> UiState {
+    let now = Instant::now();
+    let mut inner = bridge.inner.lock().expect("inner");
+    inner.snapshot_ui(now)
+}
+
+#[tauri::command]
+fn submit_order(
+    bridge: State<'_, Arc<Bridge>>,
+    side: String,
+    price: String,
+    qty: String,
+    order_type: String,
+    tif: String,
+) -> Result<(), String> {
+    let price_i: i64 = price.trim().parse().map_err(|_| "invalid price")?;
+    let qty_i: i32 = qty.trim().parse().map_err(|_| "invalid qty")?;
+    let body = serde_json::json!({
+        "side": side,
+        "price": price_i,
+        "qty": qty_i,
+        "type": order_type,
+        "tif": tif,
+    });
+    bridge.send_line(body.to_string())
+}
+
+#[tauri::command]
+fn quick_cancel_last(bridge: State<'_, Arc<Bridge>>) -> Result<(), String> {
+    let id = {
+        let inner = bridge.inner.lock().expect("inner");
+        inner
+            .last_order_id
+            .ok_or_else(|| "no last order id yet".to_string())?
+    };
+    let body = serde_json::json!({ "action": "cancel", "id": id as i64 });
+    bridge.send_line(body.to_string())
+}
+
+#[tauri::command]
+fn ping_engine(bridge: State<'_, Arc<Bridge>>) -> Result<bool, String> {
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let mut inner = bridge.inner.lock().expect("inner");
+        inner.ping_sent_at = Some(Instant::now());
+    }
+    let body = serde_json::json!({ "type": "client_ping", "id": id });
+    bridge.send_line(body.to_string())?;
+    Ok(true)
+}
+
+fn main() {
+    let bridge = Arc::new(Bridge::new());
+    let b2 = bridge.clone();
+    tauri::async_runtime::spawn(async move {
+        engine_loop(b2).await;
+    });
+
+    tauri::Builder::default()
+        .manage(bridge)
+        .invoke_handler(tauri::generate_handler![
+            get_ui_state,
+            submit_order,
+            quick_cancel_last,
+            ping_engine
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+================================================================================
+FILE: desktop-ui\ui\Cargo.toml
+================================================================================
+[package]
+name = "oes_ui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "oes_ui"
+
+[dependencies]
+leptos = { version = "0.6.15", features = ["csr"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "Window",
+  "Performance",
+  "console",
+  "EventTarget",
+  "HtmlInputElement",
+  "HtmlSelectElement",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+console_error_panic_hook = "0.1"
+
+================================================================================
+FILE: desktop-ui\ui\Trunk.toml
+================================================================================
+[build]
+target = "index.html"
+dist = "dist"
+public_url = "/"
+
+[watch]
+ignore = ["dist"]
+
+[serve]
+address = "127.0.0.1"
+port = 1420
+
+================================================================================
+FILE: desktop-ui\ui\index.html
+================================================================================
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OES Desktop</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              oesbg: "#0a0a0a",
+              bid: "#00ffa3",
+              ask: "#ff3b5c",
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      body {
+        margin: 0;
+        background: #0a0a0a;
+        color: #e5e5e5;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+    </style>
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+  </head>
+  <body>
+    <script>
+      window.__OES_INVOKE__ = async function (cmd, args) {
+        if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+          return window.__TAURI__.core.invoke(cmd, args);
+        }
+        if (
+          window.__TAURI_INTERNALS__ &&
+          window.__TAURI_INTERNALS__.invoke
+        ) {
+          return window.__TAURI_INTERNALS__.invoke(cmd, args);
+        }
+        console.warn("OES: not running inside Tauri; stub invoke", cmd);
+        if (cmd === "get_ui_state") {
+          return {
+            book: null,
+            ws_connected: false,
+            latency_ms: 0.0,
+            last_order_id: null,
+            last_fill: null,
+            midpoint_series: [],
+            fill_markers: [],
+            toasts: ["Run with: cargo tauri dev (from desktop-ui)"],
+            engine_connections: 0,
+            best_bid_cached: null,
+            best_ask_cached: null,
+          };
+        }
+        return null;
+      };
+    </script>
+  </body>
+</html>
+
+================================================================================
+FILE: desktop-ui\ui\src\lib.rs
+================================================================================
+mod components;
+mod ipc;
+mod types;
+
+use components::{
+    chart::ExecutionChart, health::HealthMonitor, order_entry::OrderEntry, price_ladder::PriceLadder,
+    toasts::ToastStack,
+};
+use ipc::invoke_json;
+use leptos::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use types::{BookSnapshot, UiState};
+use wasm_bindgen::prelude::*;
+
+static POLL_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[wasm_bindgen(start)]
+pub fn main() {
+    console_error_panic_hook::set_once();
+    mount_to_body(|| view! { <App/> });
+}
+
+#[component]
+fn App() -> impl IntoView {
+    let (book, set_book) = create_signal(Option::<BookSnapshot>::None);
+    let (series, set_series) = create_signal(Vec::<(f64, f64)>::new());
+    let (fills, set_fills) = create_signal(Vec::<(f64, f64)>::new());
+    let (ws_ok, set_ws) = create_signal(false);
+    let (latency, set_latency) = create_signal(0.0_f64);
+    let (last_order, set_last_order) = create_signal(Option::<u64>::None);
+    let (connections, set_connections) = create_signal(0_u32);
+    let (bbc, set_bbc) = create_signal(Option::<i64>::None);
+    let (bac, set_bac) = create_signal(Option::<i64>::None);
+    let (toasts, set_toasts) = create_signal(Vec::<String>::new());
+
+    if !POLL_STARTED.swap(true, Ordering::SeqCst) {
+        spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(16).await;
+                match invoke_json::<UiState>("get_ui_state", &serde_json::json!({})).await {
+                    Ok(s) => {
+                        set_book.set(s.book);
+                        set_series.set(s.midpoint_series);
+                        set_fills.set(s.fill_markers);
+                        set_ws.set(s.ws_connected);
+                        set_latency.set(s.latency_ms);
+                        set_last_order.set(s.last_order_id);
+                        set_connections.set(s.engine_connections);
+                        set_bbc.set(s.best_bid_cached);
+                        set_bac.set(s.best_ask_cached);
+                        for t in s.toasts {
+                            set_toasts.update(|v| v.push(t));
+                        }
+                    }
+                    Err(e) => {
+                        set_ws.set(false);
+                        set_toasts.update(|v| v.push(format!("state sync: {e}")));
+                    }
+                }
+            }
+        });
+    }
+
+    let ping = move |_| {
+        spawn_local(async move {
+            let r: Result<bool, String> = invoke_json("ping_engine", &serde_json::json!({})).await;
+            if let Err(e) = r {
+                set_toasts.update(|v| v.push(format!("ping: {e}")));
+            }
+        });
+    };
+
+    view! {
+        <div class="min-h-screen bg-oesbg text-neutral-200 p-3 flex flex-col gap-3">
+            <header class="flex items-center justify-between border-b border-neutral-800 pb-2">
+                <div>
+                    <div class="text-sm tracking-widest text-neutral-400">OES DESKTOP</div>
+                    <div class="text-[10px] text-neutral-600">Tauri + Leptos | engine ws://127.0.0.1:8080/ws</div>
+                </div>
+                <div class="flex items-center gap-2 text-xs">
+                    <span class="text-neutral-500">last id</span>
+                    <span class="text-emerald-300 font-mono">{move || last_order.get().map(|x| x.to_string()).unwrap_or_else(|| "—".into())}</span>
+                    <button class="px-2 py-1 rounded border border-cyan-800 text-cyan-200 text-xs" on:click=ping>"ping"</button>
+                </div>
+            </header>
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-3 flex-1">
+                <PriceLadder book=book />
+                <div class="flex flex-col gap-3">
+                    <ExecutionChart series=series fills=fills />
+                    <HealthMonitor
+                        ws=ws_ok
+                        latency=latency
+                        connections=connections
+                        best_bid_cached=bbc
+                        best_ask_cached=bac
+                    />
+                </div>
+                <div class="flex flex-col gap-3">
+                    <OrderEntry on_toast=set_toasts />
+                </div>
+            </div>
+            <ToastStack items=toasts set_items=set_toasts />
+        </div>
+    }
+}
+
+================================================================================
+FILE: desktop-ui\ui\src\types.rs
+================================================================================
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BookLevel {
+    pub price: i64,
+    pub qty: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BookSnapshot {
+    #[serde(rename = "type", default)]
+    pub msg_type: Option<String>,
+    #[serde(default)]
+    pub best_bid: i64,
+    pub best_ask: Option<i64>,
+    #[serde(default)]
+    pub best_bid_cached: Option<i64>,
+    pub best_ask_cached: Option<i64>,
+    #[serde(default)]
+    pub bids: Vec<BookLevel>,
+    #[serde(default)]
+    pub asks: Vec<BookLevel>,
+    pub connections: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UiState {
+    pub book: Option<BookSnapshot>,
+    pub ws_connected: bool,
+    pub latency_ms: f64,
+    pub last_order_id: Option<u64>,
+    /// (t_seconds, midpoint_usd) — time is seconds since the Tauri bridge started
+    pub midpoint_series: Vec<(f64, f64)>,
+    /// (t_seconds, fill_price_usd)
+    pub fill_markers: Vec<(f64, f64)>,
+    pub toasts: Vec<String>,
+    pub engine_connections: u32,
+    pub best_bid_cached: Option<i64>,
+    pub best_ask_cached: Option<i64>,
+}
+
+/// Fixed-point: engine stores cents as integer; 10500 -> $105.00 (see `types.hpp` / `main.cpp` display).
+#[inline]
+pub fn price_to_display(price: i64) -> f64 {
+    price as f64 / 100.0
+}
+
+#[inline]
+pub fn midpoint(best_bid: i64, best_ask: Option<i64>) -> Option<f64> {
+    let ask = best_ask?;
+    if best_bid <= 0 || ask <= 0 || ask == i64::MAX {
+        return None;
+    }
+    Some((price_to_display(best_bid) + price_to_display(ask)) / 2.0)
+}
+
+================================================================================
+FILE: desktop-ui\ui\src\ipc.rs
+================================================================================
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_wasm_bindgen::{from_value, to_value};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
+
+pub async fn invoke_json<T: DeserializeOwned>(cmd: &str, args: &impl Serialize) -> Result<T, String> {
+    let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
+    let invoke = js_sys::Reflect::get(&window, &JsValue::from_str("__OES_INVOKE__"))
+        .map_err(|_| "missing __OES_INVOKE__ (index.html script)".to_string())?;
+    let func: js_sys::Function = invoke
+        .dyn_into()
+        .map_err(|_| "__OES_INVOKE__ is not a function".to_string())?;
+    let args_val = to_value(args).map_err(|e| e.to_string())?;
+    let promise = func
+        .call2(&JsValue::NULL, &JsValue::from_str(cmd), &args_val)
+        .map_err(|e| format!("invoke call failed: {:?}", e))?;
+    let promise = js_sys::Promise::resolve(&promise);
+    let result = JsFuture::from(promise)
+        .await
+        .map_err(|e| format!("invoke await failed: {:?}", e))?;
+    from_value(result).map_err(|e| e.to_string())
+}
+
+================================================================================
+FILE: desktop-ui\ui\src\components\mod.rs
+================================================================================
+pub mod chart;
+pub mod health;
+pub mod order_entry;
+pub mod price_ladder;
+pub mod toasts;
+
+================================================================================
+FILE: desktop-ui\ui\src\components\chart.rs
+================================================================================
+use leptos::*;
+
+/// Plot area (SVG user units)
+const PX0: f64 = 64.0;
+const PX1: f64 = 536.0;
+const PY0: f64 = 32.0;
+const PY1: f64 = 228.0;
+
+fn map_x(t: f64, t_lo: f64, t_hi: f64) -> f64 {
+    if (t_hi - t_lo).abs() < 1e-9 {
+        return (PX0 + PX1) / 2.0;
+    }
+    PX0 + (t - t_lo) / (t_hi - t_lo) * (PX1 - PX0)
+}
+
+fn map_y(p: f64, p_lo: f64, p_hi: f64) -> f64 {
+    if (p_hi - p_lo).abs() < 1e-9 {
+        return (PY0 + PY1) / 2.0;
+    }
+    PY1 - (p - p_lo) / (p_hi - p_lo) * (PY1 - PY0)
+}
+
+#[component]
+pub fn ExecutionChart(
+    series: ReadSignal<Vec<(f64, f64)>>,
+    fills: ReadSignal<Vec<(f64, f64)>>,
+) -> impl IntoView {
+    view! {
+        <div class="rounded border border-neutral-800 bg-black/40 p-3 flex flex-col gap-2 min-h-[280px]">
+            <div class="text-xs uppercase tracking-widest text-neutral-500">
+                midpoint vs time (best bid / best ask on the book)
+            </div>
+            <div class="text-[10px] text-neutral-600 leading-snug">
+                X: seconds since the desktop app connected. Y: midpoint = (best bid + best ask) / 2 in display dollars (engine fixed-point / 100).
+            </div>
+            <svg class="w-full h-[240px]" viewBox="0 0 560 260" preserveAspectRatio="xMidYMid meet">
+                {move || {
+                    let pts = series.get();
+                    let fill_pts = fills.get();
+
+                    if pts.is_empty() {
+                        return view! {
+                            <text x="20" y="120" fill="#666" font-size="13">waiting for book / midpoint…</text>
+                        }
+                        .into_view();
+                    }
+
+                    let mut t_lo = pts.iter().map(|(t, _)| *t).fold(f64::INFINITY, f64::min);
+                    let mut t_hi = pts.iter().map(|(t, _)| *t).fold(f64::NEG_INFINITY, f64::max);
+                    for (t, _) in &fill_pts {
+                        t_lo = t_lo.min(*t);
+                        t_hi = t_hi.max(*t);
+                    }
+                    if pts.len() == 1 {
+                        t_lo -= 1.0;
+                        t_hi += 1.0;
+                    } else if (t_hi - t_lo) < 0.5 {
+                        let c = (t_lo + t_hi) / 2.0;
+                        t_lo = c - 0.5;
+                        t_hi = c + 0.5;
+                    }
+
+                    let mut p_lo = pts.iter().map(|(_, p)| *p).fold(f64::INFINITY, f64::min);
+                    let mut p_hi = pts.iter().map(|(_, p)| *p).fold(f64::NEG_INFINITY, f64::max);
+                    for (_, p) in &fill_pts {
+                        p_lo = p_lo.min(*p);
+                        p_hi = p_hi.max(*p);
+                    }
+                    let pad_p = ((p_hi - p_lo).abs() * 0.08).max(0.02);
+                    p_lo -= pad_p;
+                    p_hi += pad_p;
+
+                    let mut d = String::new();
+                    for (i, (t, p)) in pts.iter().enumerate() {
+                        let x = map_x(*t, t_lo, t_hi);
+                        let y = map_y(*p, p_lo, p_hi);
+                        if i == 0 {
+                            d.push_str(&format!("M {x:.2},{y:.2} "));
+                        } else {
+                            d.push_str(&format!("L {x:.2},{y:.2} "));
+                        }
+                    }
+
+                    let x_axis_y = PY1 + 4.0;
+                    let markers = fill_pts
+                        .into_iter()
+                        .map(|(t, p)| {
+                            let x = map_x(t, t_lo, t_hi);
+                            let y = map_y(p, p_lo, p_hi);
+                            view! {
+                                <circle
+                                    cx=format!("{:.2}", x)
+                                    cy=format!("{:.2}", y)
+                                    r="3.0"
+                                    fill="#fbbf24"
+                                    opacity="0.9"
+                                    stroke="#78350f"
+                                    stroke-width="0.6"
+                                />
+                            }
+                        })
+                        .collect_view();
+
+                    let nx = 5usize;
+                    let x_ticks = (0..nx).map(|i| {
+                        let u = i as f64 / (nx - 1).max(1) as f64;
+                        let tv = t_lo + u * (t_hi - t_lo);
+                        let x = map_x(tv, t_lo, t_hi);
+                        view! {
+                            <g>
+                                <line
+                                    x1=format!("{:.1}", x)
+                                    y1=format!("{:.1}", PY1)
+                                    x2=format!("{:.1}", x)
+                                    y2=format!("{:.1}", x_axis_y + 2.0)
+                                    stroke="#444"
+                                    stroke-width="1"
+                                />
+                                <text
+                                    x=format!("{:.1}", x - 12.0)
+                                    y=format!("{:.1}", x_axis_y + 14.0)
+                                    fill="#888"
+                                    font-size="9"
+                                >
+                                    {format!("{:.1}s", tv)}
+                                </text>
+                            </g>
+                        }
+                    }).collect_view();
+
+                    let ny = 5usize;
+                    let y_ticks = (0..ny).map(|i| {
+                        let u = i as f64 / (ny - 1).max(1) as f64;
+                        let pv = p_lo + u * (p_hi - p_lo);
+                        let y = map_y(pv, p_lo, p_hi);
+                        view! {
+                            <g>
+                                <line
+                                    x1=format!("{:.1}", PX0 - 4.0)
+                                    y1=format!("{:.1}", y)
+                                    x2=format!("{:.1}", PX1)
+                                    y2=format!("{:.1}", y)
+                                    stroke="#2a2a2a"
+                                    stroke-width="1"
+                                    stroke-dasharray="3,3"
+                                />
+                                <text
+                                    x="6"
+                                    y=format!("{:.1}", y + 3.0)
+                                    fill="#888"
+                                    font-size="9"
+                                >
+                                    {format!("{:.2}", pv)}
+                                </text>
+                            </g>
+                        }
+                    }).collect_view();
+
+                    view! {
+                        <rect x="0" y="0" width="560" height="260" fill="#050505" />
+                        {y_ticks}
+                        <line
+                            x1=format!("{:.1}", PX0)
+                            y1=format!("{:.1}", PY0)
+                            x2=format!("{:.1}", PX0)
+                            y2=format!("{:.1}", PY1)
+                            stroke="#555"
+                            stroke-width="1.2"
+                        />
+                        <line
+                            x1=format!("{:.1}", PX0)
+                            y1=format!("{:.1}", PY1)
+                            x2=format!("{:.1}", PX1)
+                            y2=format!("{:.1}", PY1)
+                            stroke="#555"
+                            stroke-width="1.2"
+                        />
+                        {x_ticks}
+                        <path
+                            d=d
+                            fill="none"
+                            stroke="#22d3ee"
+                            stroke-width="1.6"
+                            vector-effect="non-scaling-stroke"
+                        />
+                        {markers}
+                        <text x="64" y="252" fill="#777" font-size="10">"time (s)"</text>
+                        <text x="8" y="130" fill="#777" font-size="9">"mid ($)"</text>
+                    }
+                    .into_view()
+                }}
+            </svg>
+            <div class="text-[10px] text-neutral-600">gold: last traded price at fill time</div>
+        </div>
+    }
+}
+
+================================================================================
+FILE: desktop-ui\ui\src\components\health.rs
+================================================================================
+use leptos::*;
+
+#[component]
+pub fn HealthMonitor(
+    ws: ReadSignal<bool>,
+    latency: ReadSignal<f64>,
+    connections: ReadSignal<u32>,
+    best_bid_cached: ReadSignal<Option<i64>>,
+    best_ask_cached: ReadSignal<Option<i64>>,
+) -> impl IntoView {
+    view! {
+        <div class="rounded border border-neutral-800 bg-black/40 p-3 space-y-2 text-xs">
+            <div class="text-[10px] uppercase tracking-widest text-neutral-500">system health</div>
+            <div class="flex justify-between">
+                <span class="text-neutral-500">ws bridge</span>
+                <span class=move || if ws.get() { "text-emerald-400" } else { "text-red-400" }>
+                    {move || if ws.get() { "connected" } else { "disconnected" }}
+                </span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-neutral-500">ping rtt (ms)</span>
+                <span>{move || format!("{:.2}", latency.get())}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-neutral-500">engine connections</span>
+                <span>{move || connections.get().to_string()}</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-neutral-500">top-of-book cache (bid / ask)</span>
+                <span class="text-neutral-300">
+                    {move || {
+                        let bb = best_bid_cached.get().map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+                        let ba = best_ask_cached.get().map(|v| v.to_string()).unwrap_or_else(|| "—".into());
+                        format!("{bb} / {ba}")
+                    }}
+                </span>
+            </div>
+            <div class="text-[10px] text-neutral-600 leading-snug">
+                cache fields mirror OrderBook best bid/ask; UI poll throttled to ~60Hz.
+            </div>
+        </div>
+    }
+}
+
+================================================================================
+FILE: desktop-ui\ui\src\components\order_entry.rs
+================================================================================
+use crate::ipc::invoke_json;
+use leptos::*;
+use serde::Serialize;
+use wasm_bindgen::JsCast;
+
+#[derive(Serialize)]
+struct SubmitArgs {
+    side: String,
+    price: String,
+    qty: String,
+    order_type: String,
+    tif: String,
+}
+
+#[component]
+pub fn OrderEntry(on_toast: WriteSignal<Vec<String>>) -> impl IntoView {
+    let price = create_rw_signal(String::from("10050"));
+    let qty = create_rw_signal(String::from("10"));
+    let order_type = create_rw_signal(String::from("LIMIT"));
+    let tif = create_rw_signal(String::from("GTC"));
+    let busy = create_rw_signal(false);
+
+    let fire = move |side: &'static str| {
+        let p = price.get();
+        let q = qty.get();
+        let ot = order_type.get();
+        let tf = tif.get();
+        busy.set(true);
+        spawn_local(async move {
+            let res: Result<(), String> = invoke_json(
+                "submit_order",
+                &SubmitArgs {
+                    side: side.to_string(),
+                    price: p,
+                    qty: q,
+                    order_type: ot,
+                    tif: tf,
+                },
+            )
+            .await;
+            busy.set(false);
+            if let Err(e) = res {
+                on_toast.update(|t| t.push(format!("Order rejected: {e}")));
+            }
+        });
+    };
+
+    let quick_cancel = move |_| {
+        busy.set(true);
+        spawn_local(async move {
+            let r: Result<(), String> = invoke_json("quick_cancel_last", &serde_json::json!({})).await;
+            busy.set(false);
+            if let Err(e) = r {
+                on_toast.update(|t| t.push(format!("Cancel failed: {e}")));
+            }
+        });
+    };
+
+    view! {
+        <div class="rounded border border-neutral-800 bg-black/40 p-3 space-y-3">
+            <div class="text-xs uppercase tracking-widest text-neutral-500">order entry</div>
+            <div class="grid grid-cols-2 gap-2">
+                <label class="text-[10px] text-neutral-500">price (fixed-point)</label>
+                <label class="text-[10px] text-neutral-500">qty</label>
+                <input type="text" class="bg-neutral-950 border border-neutral-800 rounded px-2 py-1 text-sm"
+                    prop:value=move || price.get()
+                    on:input=move |ev| {
+                        if let Some(t) = ev.target() {
+                            if let Ok(el) = t.dyn_into::<web_sys::HtmlInputElement>() {
+                                price.set(el.value());
+                            }
+                        }
+                    }
+                />
+                <input type="text" class="bg-neutral-950 border border-neutral-800 rounded px-2 py-1 text-sm"
+                    prop:value=move || qty.get()
+                    on:input=move |ev| {
+                        if let Some(t) = ev.target() {
+                            if let Ok(el) = t.dyn_into::<web_sys::HtmlInputElement>() {
+                                qty.set(el.value());
+                            }
+                        }
+                    }
+                />
+            </div>
+            <div class="flex flex-wrap gap-2">
+                <button class="px-3 py-1 rounded bg-emerald-900/40 text-bid border border-emerald-800 disabled:opacity-40"
+                    prop:disabled=move || busy.get()
+                    on:click=move |_| fire("BUY")>"buy"</button>
+                <button class="px-3 py-1 rounded bg-red-900/40 text-ask border border-red-800 disabled:opacity-40"
+                    prop:disabled=move || busy.get()
+                    on:click=move |_| fire("SELL")>"sell"</button>
+            </div>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+                <span class="text-neutral-500">type</span>
+                <span class="text-neutral-500">tif</span>
+                <select class="bg-neutral-950 border border-neutral-800 rounded px-1 py-1"
+                    prop:value=move || order_type.get()
+                    on:change=move |ev| {
+                        if let Some(t) = ev.target() {
+                            if let Ok(el) = t.dyn_into::<web_sys::HtmlSelectElement>() {
+                                order_type.set(el.value());
+                            }
+                        }
+                    }>
+                    <option value="LIMIT">"LIMIT"</option>
+                    <option value="MARKET">"MARKET"</option>
+                </select>
+                <select class="bg-neutral-950 border border-neutral-800 rounded px-1 py-1"
+                    prop:value=move || tif.get()
+                    on:change=move |ev| {
+                        if let Some(t) = ev.target() {
+                            if let Ok(el) = t.dyn_into::<web_sys::HtmlSelectElement>() {
+                                tif.set(el.value());
+                            }
+                        }
+                    }>
+                    <option value="GTC">"GTC"</option>
+                    <option value="IOC">"IOC"</option>
+                    <option value="FOK">"FOK"</option>
+                </select>
+            </div>
+            <button class="w-full py-1 rounded border border-amber-700/50 text-amber-200 text-xs disabled:opacity-40"
+                prop:disabled=move || busy.get()
+                on:click=quick_cancel>"quick cancel (last order id)"</button>
+        </div>
+    }
+}
+
+================================================================================
+FILE: desktop-ui\ui\src\components\price_ladder.rs
+================================================================================
+use crate::types::{price_to_display, BookLevel, BookSnapshot};
+use leptos::*;
+
+fn max_qty(levels: &[BookLevel]) -> i32 {
+    levels.iter().map(|l| l.qty).max().unwrap_or(1).max(1)
+}
+
+#[component]
+pub fn PriceLadder(book: ReadSignal<Option<BookSnapshot>>) -> impl IntoView {
+    view! {
+        <div class="rounded border border-neutral-800 bg-black/40 p-3 min-h-[520px] flex flex-col">
+            <div class="text-xs uppercase tracking-widest text-neutral-500 mb-2">L2 ladder (top 10)</div>
+            <div class="flex-1 flex flex-col text-sm">
+                {move || {
+                    let b = match book.get() {
+                        Some(v) => v,
+                        None => return view! { <div class="text-neutral-600">no book data</div> }.into_view(),
+                    };
+
+                    let max_v = max_qty(&b.bids).max(max_qty(&b.asks));
+                    let asks_dom: Vec<BookLevel> = b.asks.iter().take(10).rev().cloned().collect();
+                    let bids_show: Vec<BookLevel> = b.bids.iter().take(10).cloned().collect();
+                    let mid = crate::types::midpoint(b.best_bid, b.best_ask);
+                    let spread_txt = match (b.best_bid, b.best_ask) {
+                        (bb, Some(ba)) if bb > 0 && ba < i64::MAX => {
+                            let spr = price_to_display(ba - bb);
+                            let m = mid.map(|m| format!("{m:.4}")).unwrap_or_default();
+                            format!("{spr:.2}  |  mid {m}")
+                        }
+                        _ => "—".to_string(),
+                    };
+
+                    view! {
+                        <div class="flex-1 flex flex-col">
+                            <div class="text-neutral-500 text-xs mb-1">asks</div>
+                            <div class="flex flex-col gap-0.5 flex-1 justify-end">
+                                {asks_dom.into_iter().map(|lvl| {
+                                    let intensity = (lvl.qty as f64 / max_v as f64).clamp(0.0, 1.0);
+                                    let bg = format!("rgba(255,59,92,{:.2})", 0.08 + intensity * 0.35);
+                                    view! {
+                                        <div class="flex justify-between px-2 py-1 rounded border border-red-900/30"
+                                             style:background-color=bg>
+                                            <span class="text-ask">{format!("{:.2}", price_to_display(lvl.price))}</span>
+                                            <span class="text-neutral-300">{lvl.qty}</span>
+                                        </div>
+                                    }
+                                }).collect_view()}
+                            </div>
+                            <div class="my-2 py-2 text-center border-y border-neutral-800 bg-neutral-950/80">
+                                <div class="text-[10px] text-neutral-500">spread / mid</div>
+                                <div class="text-emerald-200 font-semibold">{spread_txt}</div>
+                            </div>
+                            <div class="text-neutral-500 text-xs mb-1">bids</div>
+                            <div class="flex flex-col gap-0.5 flex-1">
+                                {bids_show.into_iter().map(|lvl| {
+                                    let intensity = (lvl.qty as f64 / max_v as f64).clamp(0.0, 1.0);
+                                    let bg = format!("rgba(0,255,163,{:.2})", 0.08 + intensity * 0.35);
+                                    view! {
+                                        <div class="flex justify-between px-2 py-1 rounded border border-emerald-900/30"
+                                             style:background-color=bg>
+                                            <span class="text-bid">{format!("{:.2}", price_to_display(lvl.price))}</span>
+                                            <span class="text-neutral-300">{lvl.qty}</span>
+                                        </div>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        </div>
+                    }.into_view()
+                }}
+            </div>
+        </div>
+    }
+}
+
+================================================================================
+FILE: desktop-ui\ui\src\components\toasts.rs
+================================================================================
+use leptos::*;
+
+#[component]
+pub fn ToastStack(items: ReadSignal<Vec<String>>, set_items: WriteSignal<Vec<String>>) -> impl IntoView {
+    view! {
+        <div class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 max-w-sm">
+            <For
+                each=move || {
+                    items.get().into_iter().enumerate().collect::<Vec<_>>()
+                }
+                key=|(i, _)| *i
+                children=move |(i, msg)| {
+                    view! {
+                        <div class="bg-neutral-900 border border-red-900/60 text-red-100 text-xs px-3 py-2 rounded shadow-lg flex justify-between gap-3">
+                            <span>{msg}</span>
+                            <button class="text-neutral-500 hover:text-white" on:click=move |_| {
+                                set_items.update(|v| { if i < v.len() { v.remove(i); } });
+                            }>"×"</button>
+                        </div>
+                    }
+                }
+            />
+        </div>
+    }
+}
+
+================================================================================
+FILE: include/crow_all.h  (THIRD-PARTY CrowCpp single-header — NOT FULLY INLINED)
+================================================================================
+Total lines: 15391
+Source: https://github.com/CrowCpp/Crow/releases (see Readme.txt in repo)
+--- first 90 lines ---
+// SPDX-License-Identifier: BSD-3-Clause AND ISC AND MIT
+/*BSD 3-Clause License
+
+Copyright (c) 2014-2017, ipkn
+              2020-2026, CrowCpp
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the author nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The Crow logo and other graphic material (excluding third party logos) used are under exclusive Copyright (c) 2021-2022, Farook Al-Sammarraie (The-EDev), All rights reserved.
+*/
+#pragma once
+
+#include <stdio.h>
+#include <string.h>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <iostream>
+#include <memory>
+
+namespace crow
+{
+
+// ----------------------------------------------------------------------------
+// qs_parse (modified)
+// https://github.com/bartgrantham/qs_parse
+// ----------------------------------------------------------------------------
+/*  Similar to strncmp, but handles URL-encoding for either string  */
+int qs_strncmp(const char* s, const char* qs, size_t n);
+
+
+/*  Finds the beginning of each key/value pair and stores a pointer in qs_kv.
+ *  Also decodes the value portion of the k/v pair *in-place*.  In a future
+ *  enhancement it will also have a compile-time option of sorting qs_kv
+ *  alphabetically by key.  */
+size_t qs_parse(char* qs, char* qs_kv[], size_t qs_kv_size, bool parse_url);
+
+
+/*  Used by qs_parse to decode the value portion of a k/v pair  */
+int qs_decode(char * qs);
+
+
+/*  Looks up the value according to the key on a pre-processed query string
+ *  A future enhancement will be a compile-time option to look up the key
+ *  in a pre-sorted qs_kv array via a binary search.  */
+//char * qs_k2v(const char * key, char * qs_kv[], int qs_kv_size);
+ char * qs_k2v(const char * key, char * const * qs_kv, size_t qs_kv_size, int nth);
+
+
+/*  Non-destructive lookup of value, based on key.  User provides the
+ *  destinaton string and length.  */
+char * qs_scanvalue(const char * key, const char * qs, char * val, size_t val_len);
+
+// TODO: implement sorting of the qs_kv array; for now ensure it's not compiled
+#undef _qsSORTING
+
+// isxdigit _is_ available in <ctype.h>, but let's avoid another header instead
+#define CROW_QS_ISHEX(x)    ((((x)>='0'&&(x)<='9') || ((x)>='A'&&(x)<='F') || ((x)>='a'&&(x)<='f')) ? 1 : 0)
+#define CROW_QS_HEX2DEC(x)  (((x)>='0'&&(x)<='9') ? (x)-48 : ((x)>='A'&&(x)<='F') ? (x)-55 : ((x)>='a'&&(x)<='f') ? (x)-87 : 0)
+#define CROW_QS_ISQSCHR(x) ((((x)=='=')||((x)=='#')||((x)=='&')||((x)=='\0')) ? 0 : 1)
+
+inline int qs_strncmp(const char * s, const char * qs, size_t n)
+{
+    unsigned char u1, u2, unyb, lnyb;
+
+    while(n-- > 0)
+--- last 8 lines ---
+                if (string.length() > 1 && string[0] == excess && string[string.length() - 1] == excess)
+                    return string.substr(1, string.length() - 2);
+                return string;
+            }
+        };
+    } // namespace multipart
+} // namespace crow
+
+

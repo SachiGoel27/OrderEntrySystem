@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OES Desktop</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              oesbg: "#0a0a0a",
+              bid: "#00ffa3",
+              ask: "#ff3b5c",
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      body {
+        margin: 0;
+        background: #0a0a0a;
+        color: #e5e5e5;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+    </style>
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+  </head>
+  <body>
+    <script>
+      window.__OES_INVOKE__ = async function (cmd, args) {
+        if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+          return window.__TAURI__.core.invoke(cmd, args);
+        }
+        if (
+          window.__TAURI_INTERNALS__ &&
+          window.__TAURI_INTERNALS__.invoke
+        ) {
+          return window.__TAURI_INTERNALS__.invoke(cmd, args);
+        }
+        console.warn("OES: not running inside Tauri; stub invoke", cmd);
+        if (cmd === "get_ui_state") {
+          return {
+            book: null,
+            ws_connected: false,
+            latency_ms: 0.0,
+            last_order_id: null,
+            last_fill: null,
+            midpoint_series: [],
+            fill_markers: [],
+            toasts: ["Run with: cargo tauri dev (from desktop-ui)"],
+            engine_connections: 0,
+            best_bid_cached: null,
+            best_ask_cached: null,
+          };
+        }
+        return null;
+      };
+    </script>
+  </body>
+</html>

@@ -2,3 +2,7 @@ personal-notes.txt
 .githuba
 bin/
 obj/
+venv
+desktop-ui/target/
+desktop-ui/ui/dist/
+desktop-ui/ui/target/

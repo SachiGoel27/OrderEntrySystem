@@ -1,0 +1,18 @@
+[package]
+name = "oes-desktop"
+version = "0.1.0"
+description = "OES desktop — Tauri bridge to C++ matching engine"
+authors = ["OES"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
+tungstenite = { version = "0.24", default-features = true }
